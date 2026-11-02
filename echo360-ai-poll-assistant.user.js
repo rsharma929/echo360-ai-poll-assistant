@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Echo360 AI Poll Assistant
 // @namespace    https://github.com/rsharma929/echo360-ai-poll-assistant
-// @version      0.4.4
+// @version      0.4.5
 // @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with a resizable in-page panel. Answers MCQ + short answer via Groq (your free key) — reads the question from page text OR the slide image (vision). Offline pools as fallback.
 // @author       Rohan
 // @license      MIT
@@ -204,14 +204,28 @@
             el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true' ||
             el.classList.contains('selected') || el.classList.contains('checked') || el.classList.contains('active'));
     }
+    // Find the question STEM by content (not class name) — the student poll's stem element
+    // doesn't use question/prompt/stem/title classes, so scan visible text and pick the best
+    // "question-like" block that isn't a choice, nav, title, or results element.
+    const QT_BAD = ['polling-title', 'navbar', 'tt-nav', 'response-button', 'chart', 'ct-chart',
+        'correctanswer', 'result', 'option', 'choice', 'answer-', 'footer', 'header'];
     function getQuestionText() {
-        const sel = '[class*="question" i],[class*="prompt" i],[class*="stem" i],[class*="title" i]';
-        let best = '';
-        document.querySelectorAll(sel).forEach(el => {
-            if (!isVisible(el) || classStr(el).includes('polling-title')) return;
+        let best = '', bestScore = -1;
+        const els = document.querySelectorAll('p,span,div,h1,h2,h3,h4,h5,label,li');
+        for (const el of els) {
+            if (!isVisible(el)) continue;
+            const cls = classStr(el) + ' ' + classStr(el.parentElement);
+            if (QT_BAD.some(w => cls.includes(w))) continue;
+            if (el.closest('button,[role="button"],a,nav')) continue;
             const t = (el.innerText || '').trim();
-            if (t.length > best.length && t.length < 400) best = t;
-        });
+            if (t.length < 10 || t.length > 500) continue;
+            // leaf-ish only: skip a container whose text just repeats a visible child's full text
+            if (Array.from(el.children).some(c => isVisible(c) && (c.innerText || '').trim() === t)) continue;
+            let score = Math.min(t.length, 240);
+            if (t.indexOf('?') !== -1) score += 80;                 // looks like a question
+            if (/\b(which|what|who|where|when|why|how|identify|best|most likely)\b/i.test(t)) score += 30;
+            if (score > bestScore) { bestScore = score; best = t; }
+        }
         return best;
     }
     function getSessionTitle() {
@@ -782,5 +796,5 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     }
 
     updateMemoryView();
-    console.log('[AI Poll Assistant] v0.4.4 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
+    console.log('[AI Poll Assistant] v0.4.5 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
 })();
