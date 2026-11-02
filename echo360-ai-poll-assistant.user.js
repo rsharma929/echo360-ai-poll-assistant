@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Echo360 AI Poll Assistant
 // @namespace    https://github.com/rsharma929/echo360-ai-poll-assistant
-// @version      0.4.0
+// @version      0.4.1
 // @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with a resizable in-page panel. Answers MCQ + short answer via Groq (your free key) — reads the question from page text OR the slide image (vision). Offline pools as fallback.
 // @author       Rohan
 // @license      MIT
@@ -45,10 +45,10 @@
     const MIN_DELAY_MS = 500, MAX_DELAY_MS = 7500;
     const AI_TIMEOUT_MS = 9000;
     const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-    const GROQ_MODELS = {
-        'Groq · Llama-4 Scout (text + vision)': 'meta-llama/llama-4-scout-17b-16e-instruct',
-        'Groq · Llama-3.3-70B (text only, fast)': 'llama-3.3-70b-versatile'
-    };
+    const GROQ_MODELS_URL = 'https://api.groq.com/openai/v1/models';
+    const DEFAULT_MODEL = 'openai/gpt-oss-120b';   // current text default; click "Refresh" to list vision-capable models
+    const OFFLINE = 'offline';
+    const STARTER_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.3-70b-versatile'];
     const BASE_SYSTEM = 'You help a student answer a live medical-school class poll quickly ' +
         '(preclinical / basic sciences: anatomy, physiology, biochemistry, pharmacology, microbiology, ' +
         'pathology, histology). Answers need not be certain or fully correct. Be extremely brief.';
@@ -81,11 +81,12 @@
     };
     const DEFAULTS = {
         power: true, paused: false, autoSubmit: false, aiForMCQ: true, aiForText: true,
-        theme: 'auto', fontScale: 1, model: 'Groq · Llama-4 Scout (text + vision)', topic: '',
+        theme: 'auto', fontScale: 1, model: DEFAULT_MODEL, topic: '',
         groqKey: '', panelW: 0, panelH: 0
     };
     const S = {};
     for (const k in DEFAULTS) S[k] = store.get(k, DEFAULTS[k]);
+    if (S.model !== OFFLINE && /\s/.test(String(S.model))) S.model = DEFAULT_MODEL;  // migrate old friendly-label model values
     function saveSetting(k, v) { S[k] = v; store.set(k, v); }
     const rint = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo + 1));
 
@@ -267,7 +268,7 @@
     let memory = [];
     function rememberQA(q, a) { if (q || a) { memory.push('Q: ' + (q || '[image]') + ' | A: ' + a); if (memory.length > 6) memory.shift(); } updateMemoryView(); }
     function hasKey() { return !!(S.groqKey && S.groqKey.length > 10); }
-    function aiOn() { return S.model !== 'Offline pools only' && hasKey(); }
+    function aiOn() { return S.model !== OFFLINE && hasKey(); }
     function aiForType(mode) { return aiOn() && (mode === 'mcq' ? S.aiForMCQ : S.aiForText); }
     function isCaseQuestion(q) { return /\b(this patient|the patient|patient'?s|the above|same patient|this case|continues|previously|as described|in the vignette)\b/i.test(q || ''); }
     function withTimeout(p, ms) { return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]); }
@@ -283,7 +284,7 @@
     }
     async function groqChat(messages) {
         if (!hasKey()) throw new Error('no key');
-        const model = GROQ_MODELS[S.model] || 'meta-llama/llama-4-scout-17b-16e-instruct';
+        const model = (S.model && S.model !== OFFLINE) ? S.model : DEFAULT_MODEL;
         const r = await gmRequest({
             method: 'POST', url: GROQ_URL, timeout: AI_TIMEOUT_MS,
             headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + S.groqKey },
@@ -359,7 +360,7 @@
   --fg:#e7ebf1; --fg-dim:#9aa6b7; --fg-faint:#6b7585; --accent:#2ad2c4; --accent-weak:#11312f; --accent-fg:#052321;
   --good:#3ecb79; --warn:#e0a33a; --warn-weak:#33280f; --bad:#ef6b6b; --shadow:0 14px 40px rgba(0,0,0,.55),0 2px 10px rgba(0,0,0,.4); }
 *{box-sizing:border-box}
-.panel{position:fixed;top:16px;right:16px;width:360px;height:auto;min-width:300px;min-height:240px;max-width:96vw;max-height:calc(100vh - 32px);
+.panel{position:fixed;top:16px;right:16px;width:360px;height:min(600px,calc(100vh - 32px));min-width:300px;min-height:240px;max-width:96vw;max-height:calc(100vh - 32px);
   background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);
   font-family:var(--font);font-size:calc(13px*var(--fs));z-index:2147483646;display:flex;flex-direction:column;overflow:hidden;resize:both}
 .panel.off{filter:grayscale(.6) opacity(.72)}
@@ -497,8 +498,9 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <div class="field"><label>Theme</label><div class="seg" id="themeSeg"><button data-v="light">Light</button><button data-v="dark">Dark</button><button data-v="auto">Auto</button></div></div>
       <div class="field"><div class="row"><label for="fs">Text size</label><span class="hint" id="fsVal">100%</span></div><input type="range" id="fs" min="80" max="140" step="5" value="100"></div>
       <div class="hint">Drag the panel's bottom-right corner to resize it.</div>
-      <div class="field"><label for="model">AI model</label>
-        <select id="model"><option>Groq · Llama-4 Scout (text + vision)</option><option>Groq · Llama-3.3-70B (text only, fast)</option><option>Offline pools only</option></select></div>
+      <div class="field"><label for="model">AI model <span class="hint">— click Refresh to list models your key can use</span></label>
+        <div class="row" style="gap:6px"><select id="model" style="flex:1"></select><button class="btn" id="refreshModels" style="flex:0 0 auto;min-width:0">Refresh</button></div>
+        <div class="hint">Reading slide images needs a vision-capable model — pick one from the list if your key has it.</div></div>
       <div class="row"><label>Auto-submit answers</label><button class="toggle" id="tAuto"></button></div>
       <div class="row"><label>AI for multiple-choice</label><button class="toggle" id="tMCQ"></button></div>
       <div class="row"><label>AI for short answer</label><button class="toggle" id="tText"></button></div>
@@ -520,7 +522,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     if (S.panelH > 0) $('#panel').style.height = S.panelH + 'px';
     $$('#themeSeg button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === S.theme ? 'true' : 'false'));
     $('#fs').value = Math.round(S.fontScale * 100); $('#fsVal').textContent = Math.round(S.fontScale * 100) + '%';
-    $('#ctxBox').value = S.topic; $('#model').value = S.model; $('#key').value = S.groqKey;
+    $('#ctxBox').value = S.topic; $('#key').value = S.groqKey; populateModels([]);
     $('#tAuto').setAttribute('aria-pressed', S.autoSubmit ? 'true' : 'false');
     $('#tMCQ').setAttribute('aria-pressed', S.aiForMCQ ? 'true' : 'false');
     $('#tText').setAttribute('aria-pressed', S.aiForText ? 'true' : 'false');
@@ -528,11 +530,39 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 
     function refreshAiStatus() {
         const el = $('#aiStat'); if (!el) return;
-        if (S.model === 'Offline pools only') { el.textContent = 'offline mode'; el.style.color = 'var(--fg-dim)'; }
+        if (S.model === OFFLINE) { el.textContent = 'offline mode'; el.style.color = 'var(--fg-dim)'; }
         else if (!hasKey()) { el.textContent = 'no API key set'; el.style.color = 'var(--warn)'; }
         else { el.textContent = 'key set — click Test'; el.style.color = 'var(--fg-dim)'; }
     }
     refreshAiStatus();
+
+    function populateModels(ids) {
+        const sel = $('#model'); if (!sel) return;
+        const seen = {}, list = [];
+        const add = id => { if (id && id !== OFFLINE && !seen[id]) { seen[id] = 1; list.push(id); } };
+        (ids || []).forEach(add); STARTER_MODELS.forEach(add); add(S.model);
+        let html = '<option value="' + OFFLINE + '">Offline (no AI)</option>';
+        list.forEach(id => { html += '<option value="' + esc(id) + '">' + esc(id) + '</option>'; });
+        sel.innerHTML = html;
+        sel.value = (S.model === OFFLINE || seen[S.model]) ? S.model : (list[0] || OFFLINE);
+    }
+    async function fetchModels() {
+        if (!hasKey()) return 0;
+        try {
+            const r = await gmRequest({ method: 'GET', url: GROQ_MODELS_URL, timeout: AI_TIMEOUT_MS, headers: { 'Authorization': 'Bearer ' + S.groqKey } });
+            if (r.status < 200 || r.status >= 300) return 0;
+            const j = JSON.parse(r.responseText); const ids = (j.data || []).map(m => m.id).filter(Boolean).sort();
+            populateModels(ids); return ids.length;
+        } catch (e) { return 0; }
+    }
+    $('#refreshModels').addEventListener('click', async function () {
+        const note = $('#aiStat');
+        if (!hasKey()) { note.textContent = 'enter a key first'; note.style.color = 'var(--warn)'; return; }
+        this.disabled = true; const old = this.textContent; this.textContent = '…';
+        const n = await fetchModels();
+        note.textContent = n ? ('loaded ' + n + ' models') : 'could not list models'; note.style.color = n ? 'var(--good)' : 'var(--bad)';
+        this.disabled = false; this.textContent = old;
+    });
 
     $('#themeSeg').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return;
         $$('#themeSeg button').forEach(x => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
@@ -735,5 +765,5 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     }
 
     updateMemoryView();
-    console.log('[AI Poll Assistant] v0.4.0 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
+    console.log('[AI Poll Assistant] v0.4.1 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
 })();
