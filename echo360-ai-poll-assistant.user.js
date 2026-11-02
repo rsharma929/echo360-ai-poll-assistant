@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Echo360 AI Poll Assistant
 // @namespace    https://github.com/rsharma929/echo360-ai-poll-assistant
-// @version      0.1.0
-// @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with an in-page control panel. Phase 1–2: draggable panel + live question detection + offline answers. AI brain (Puter/Groq) lands in Phase 3.
+// @version      0.2.0
+// @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with an in-page control panel. Reads the question (text OR slide image via Puter vision) and answers; offline pools as fallback.
 // @author       Rohan
 // @license      MIT
 // @match        https://*.ttpoll.com/*
@@ -11,17 +11,20 @@
 // @match        https://echo360.com/*
 // @match        https://*.turningtechnologies.com/*
 // @match        https://turningtechnologies.com/*
+// @require      https://js.puter.com/v2/
 // @grant        none
 // @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/rsharma929/echo360-ai-poll-assistant/main/echo360-ai-poll-assistant.user.js
+// @updateURL    https://raw.githubusercontent.com/rsharma929/echo360-ai-poll-assistant/main/echo360-ai-poll-assistant.user.js
 // ==/UserScript==
 
 /*
- * Brand-new, standalone tool — NOT the same as pointsolutions-poll-automation.
- * Phase 1–2 (this file): the control panel + detection + an OFFLINE answer path.
- *   - Auto-submit is OFF by default so you can first confirm it detects your polls
- *     correctly. Flip "Auto-submit" on in Settings once you're happy.
- * Phase 3 (next): the AI brain — Puter.js (keyless) primary, optional Groq key,
- *   with these offline pools as the final fallback. That will add @grant/@connect/@require.
+ * Standalone AI Poll Assistant — NOT the same as pointsolutions-poll-automation.
+ * v0.2: AI brain via Puter.js (keyless) — reads the question from page text OR the slide IMAGE
+ *       (vision) and answers. Offline preclinical pools are the fallback when the AI path is
+ *       blocked (e.g. the site's CSP blocks Puter), rate-limited, slow, or model = Offline.
+ *       Auto-submit is still OFF by default — confirm detection, then enable it in Settings.
+ * First AI use: click "Connect AI" in Settings (or send a Chat) to sign into Puter once.
  */
 (function () {
     'use strict';
@@ -29,13 +32,16 @@
     // ==========================================================================
     // 0. CONFIG + SETTINGS
     // ==========================================================================
-    const NS = 'ePA_';                 // localStorage prefix
-    const SCAN_MS = 1000;              // how often we look at the page
-    const MIN_DELAY_MS = 500;          // fastest we'll answer after spotting a question
-    const MAX_DELAY_MS = 7500;         // slowest (randomised per question)
+    const NS = 'ePA_';
+    const SCAN_MS = 1000;
+    const MIN_DELAY_MS = 500, MAX_DELAY_MS = 7500;
+    const AI_TIMEOUT_MS = 13000;
+    const PUTER_MODELS = {
+        'Puter · GPT-4o-mini (vision)': 'gpt-4o-mini',
+        'Puter · Gemini Flash (vision)': 'google/gemini-2.0-flash',
+        'Puter · default': null
+    };
 
-    // Offline answer pools (preclinical / basic sciences). Used now, and later as the
-    // final fallback behind the AI. Short entries — boxes expect a word/phrase. NEVER "IDK".
     const DEFAULT_POOL = ['Supportive care', 'Monitor and reassess', 'Depends on the mechanism',
         'Increased activity', 'Inflammation', 'Negative feedback', 'Homeostasis'];
     const CATEGORY_POOLS = {
@@ -46,7 +52,6 @@
         mechanism: ['Increased cAMP', 'Inhibits the enzyme', 'Blocks the receptor', 'Competitive inhibition', 'Increased sympathetic tone'],
         general:   DEFAULT_POOL
     };
-    // Optional per-topic term banks (fuzzy-matched to the topic you type in the Context tab).
     const TOPIC_BANKS = {
         thyroid: ['Levothyroxine', 'Hashimoto thyroiditis', 'Graves disease', 'TSH', 'Follicular cells', 'Methimazole', 'Hypothyroidism'],
         cardio:  ['Reduced ejection fraction', 'Beta blocker', 'ACE inhibitor', 'Myocardial infarction', 'Afterload', 'Loop diuretic'],
@@ -60,23 +65,21 @@
     };
 
     const DEFAULTS = {
-        power: true, paused: false, autoSubmit: false, aiForMCQ: false,
-        confirm: false, theme: 'auto', fontScale: 1, model: 'Offline pools only',
-        groqKey: '', topic: ''
+        power: true, paused: false, autoSubmit: false, aiForMCQ: true,
+        confirm: false, theme: 'auto', fontScale: 1, model: 'Puter · default',
+        topic: ''
     };
     const S = loadSettings();
-
     function loadSettings() {
         const s = Object.assign({}, DEFAULTS);
         try { for (const k in DEFAULTS) { const v = localStorage.getItem(NS + k); if (v !== null) s[k] = JSON.parse(v); } } catch (e) {}
         return s;
     }
     function saveSetting(k, v) { S[k] = v; try { localStorage.setItem(NS + k, JSON.stringify(v)); } catch (e) {} }
-
     const rint = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo + 1));
 
     // ==========================================================================
-    // 1. DETECTION HELPERS  (ported from pointsolutions-poll-automation, Angular-safe)
+    // 1. DETECTION HELPERS (ported; Angular-safe)
     // ==========================================================================
     function isVisible(el) {
         const r = el.getBoundingClientRect(), st = getComputedStyle(el);
@@ -116,8 +119,7 @@
         return false;
     }
     function isNonAnswerButton(el) {
-        if (el.disabled) return true;
-        if (el.tagName === 'IFRAME') return true;
+        if (el.disabled || el.tagName === 'IFRAME') return true;
         if (el.getAttribute && el.getAttribute('role') === 'tab') return true;
         if (isChatSupport(el)) return true;
         return matchesWords(el, NON_ANSWER_WORDS, true);
@@ -126,8 +128,6 @@
         if (el.disabled || el.tagName === 'IFRAME') return true;
         return isChatSupport(el);
     }
-
-    // Angular-safe value set: native setter + input/change so the framework registers it.
     function setNativeValue(el, value) {
         const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
         const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
@@ -162,15 +162,12 @@
         }).sort((a, b) => b.sc - a.sc);
         return scored[0].sc > 0 ? scored[0].b : cands[0];
     }
-
-    // Results/chart screen (between questions) — must be skipped, never answered.
     function onResultsScreen() {
         if (document.querySelector('.correctAnswer, .correctAnswerIcon, [class*="correctAnswer" i]')) return true;
         const chart = Array.from(document.querySelectorAll('button')).find(b =>
             (b.innerText || '').trim().toLowerCase() === 'chart' && classStr(b).includes('btn-primary'));
         return !!chart;
     }
-
     function getChoices() {
         const raw = document.querySelectorAll(
             'input[type="radio"],input[type="checkbox"],[role="radio"],[role="checkbox"],[class*="answer" i],[class*="choice" i],[class*="option" i],button');
@@ -197,8 +194,6 @@
             el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true' ||
             el.classList.contains('selected') || el.classList.contains('checked') || el.classList.contains('active'));
     }
-
-    // Best-effort read of the question stem text.
     function getQuestionText() {
         const sel = '[class*="question" i],[class*="prompt" i],[class*="stem" i],[class*="title" i]';
         let best = '';
@@ -209,17 +204,23 @@
         });
         return best;
     }
-    function getSessionTitle() {
-        const el = document.querySelector('.polling-title,[class*="polling-title" i]');
-        return el ? (el.innerText || '').trim() : '';
+    // The slide/canvas image for a question shown as a picture (cross-origin; Puter fetches it by URL).
+    function getSlideImage() {
+        const imgs = Array.from(document.querySelectorAll('img')).filter(el => {
+            if (!isVisible(el) || el.closest('button,a,[role="button"]')) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 160 || r.height < 110) return false;
+            const cls = classStr(el) + ' ' + classStr(el.parentElement);
+            return !['icon', 'logo', 'avatar', 'chart', 'result', 'graph', 'poll-results'].some(w => cls.includes(w));
+        });
+        return imgs.length ? (imgs[0].currentSrc || imgs[0].src || '') : '';
     }
 
     // ==========================================================================
-    // 2. OFFLINE ANSWER LOGIC  (Phase-3 AI will sit in front of this)
+    // 2. OFFLINE ANSWERS (fallback tier)
     // ==========================================================================
     const STOP = new Set(['the', 'a', 'an', 'of', 'to', 'is', 'are', 'and', 'or', 'for', 'in', 'on',
         'with', 'what', 'which', 'this', 'that', 'patient', 'following', 'most', 'likely', 'best']);
-
     function classify(q) {
         const t = (q || '').toLowerCase();
         if (/\btrue or false\b/.test(t)) return 'tf';
@@ -232,16 +233,14 @@
         if (/\b(mechanism|why|how|cause|pathophys)\b/.test(t)) return 'mechanism';
         return 'general';
     }
-    function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+    const pick = arr => arr[Math.floor(Math.random() * arr.length)];
     function topicBank() {
         const t = (S.topic || '').toLowerCase();
         if (!t) return null;
         for (const k in TOPIC_BANKS) if (t.includes(k)) return TOPIC_BANKS[k];
-        // no bank match: echo the typed topic words themselves
         const words = t.split(/[^a-z]+/).filter(w => w.length > 3 && !STOP.has(w));
         return words.length ? words.map(w => w[0].toUpperCase() + w.slice(1)) : null;
     }
-    // Returns {text, tier}
     function offlineAnswer(qText, hasText) {
         const cat = classify(qText);
         if (cat === 'tf') return { text: pick(['True', 'False']), tier: 'Offline' };
@@ -253,7 +252,63 @@
     }
 
     // ==========================================================================
-    // 3. PANEL  (Shadow-DOM isolated so the site's Angular CSS can't touch it)
+    // 3. AI BRAIN (Puter.js — keyless, vision)
+    // ==========================================================================
+    let memory = [];
+    function rememberQA(q, a) { if (q || a) { memory.push('Q: ' + (q || '[image]') + ' | A: ' + a); if (memory.length > 8) memory.shift(); } }
+    function memoryText() { return memory.length ? 'Earlier questions this session:\n' + memory.join('\n') + '\n\n' : ''; }
+
+    function puterReady() { try { return typeof puter !== 'undefined' && puter && puter.ai && typeof puter.ai.chat === 'function'; } catch (e) { return false; } }
+    function aiEnabled() { return S.model !== 'Offline pools only' && puterReady(); }
+    function withTimeout(p, ms) { return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]); }
+    function extractText(r) {
+        if (!r) return '';
+        if (typeof r === 'string') return r;
+        if (r.message && r.message.content) { const c = r.message.content; return typeof c === 'string' ? c : (Array.isArray(c) && c[0] && c[0].text) || ''; }
+        if (typeof r.text === 'string') return r.text;
+        if (typeof r.content === 'string') return r.content;
+        try { return String(r); } catch (e) { return ''; }
+    }
+    function parseQA(t) {
+        const qm = t.match(/QUESTION:\s*([\s\S]*?)(?:\n|$)/i);
+        const am = t.match(/ANSWER:\s*([\s\S]*)/i);
+        return { q: qm ? qm[1].trim() : '', a: am ? am[1].trim().split('\n')[0].trim() : '' };
+    }
+    function buildPrompt(ctx) {
+        let p = 'You are helping a student answer a live medical-school class poll (preclinical / basic sciences). ';
+        if (ctx.topic) p += "Today's topic: " + ctx.topic + '. ';
+        p += memoryText();
+        if (ctx.mode === 'mcq' && ctx.choices.length) {
+            p += 'This is a multiple-choice question. Options:\n' + ctx.choices.map((c, i) => (i + 1) + '. ' + c).join('\n') + '\n';
+            p += ctx.qText ? ('Question: ' + ctx.qText + '\n') : 'The question may be in the attached image.\n';
+            p += 'Reply in EXACTLY two lines:\nQUESTION: <the question in a few words>\nANSWER: <the exact text of the single best option above>';
+        } else {
+            p += ctx.qText ? ('Question: ' + ctx.qText + '\n') : 'The question is in the attached image — read it.\n';
+            p += 'Reply in EXACTLY two lines:\nQUESTION: <the question in a few words>\nANSWER: <a concise word or short phrase; it need not be certain; never say you do not know>';
+        }
+        return p;
+    }
+    async function aiAnswer(ctx) {
+        if (!aiEnabled()) return null;
+        const prompt = buildPrompt(ctx);
+        const modelId = PUTER_MODELS[S.model];
+        const call = (useModel) => {
+            const opts = useModel && modelId ? { model: modelId } : {};
+            return ctx.imageUrl ? puter.ai.chat(prompt, ctx.imageUrl, opts) : puter.ai.chat(prompt, opts);
+        };
+        try {
+            const raw = await withTimeout(Promise.resolve().then(() => call(true)).catch(() => call(false)), AI_TIMEOUT_MS);
+            const txt = extractText(raw);
+            if (!txt) return null;
+            const parsed = parseQA(txt);
+            const answer = parsed.a || txt.trim().split('\n')[0].slice(0, 120);
+            if (!answer) return null;
+            return { question: parsed.q, text: answer, tier: 'Puter' + (ctx.imageUrl ? ' · vision' : '') };
+        } catch (e) { return null; }
+    }
+
+    // ==========================================================================
+    // 4. PANEL (Shadow DOM)
     // ==========================================================================
     const host = document.createElement('div');
     host.id = 'echo360-ai-poll-assistant-host';
@@ -262,10 +317,8 @@
     const root = host.attachShadow({ mode: 'open' });
     root.innerHTML = PANEL_HTML();
     applyTheme(S.theme); applyFont(S.fontScale);
-
     const $ = s => root.querySelector(s);
     const $$ = s => Array.from(root.querySelectorAll(s));
-
     function applyTheme(v) { if (v === 'auto') root.host.removeAttribute('data-theme'); else root.host.setAttribute('data-theme', v); }
     function applyFont(f) { root.host.style.setProperty('--fs', f); }
 
@@ -277,24 +330,17 @@
   --accent:#0b8c9b; --accent-weak:#d7f0f2; --accent-fg:#fff;
   --good:#1f9d57; --warn:#b9781a; --warn-weak:#f6ecd7; --bad:#cf3b3b;
   --shadow:0 12px 34px rgba(26,33,48,.22),0 2px 8px rgba(26,33,48,.12);
-  --font:"IBM Plex Sans",system-ui,-apple-system,sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
-  all:initial; }
+  --font:"IBM Plex Sans",system-ui,-apple-system,sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace; all:initial; }
 @media (prefers-color-scheme:dark){:host(:not([data-theme="light"])){
   --surface:#161c26; --surface-2:#1d2430; --surface-3:#242c39; --border:#2a3340; --border-2:#222a35;
-  --fg:#e7ebf1; --fg-dim:#9aa6b7; --fg-faint:#6b7585;
-  --accent:#2ad2c4; --accent-weak:#11312f; --accent-fg:#052321;
-  --good:#3ecb79; --warn:#e0a33a; --warn-weak:#33280f; --bad:#ef6b6b;
-  --shadow:0 14px 40px rgba(0,0,0,.55),0 2px 10px rgba(0,0,0,.4); }}
+  --fg:#e7ebf1; --fg-dim:#9aa6b7; --fg-faint:#6b7585; --accent:#2ad2c4; --accent-weak:#11312f; --accent-fg:#052321;
+  --good:#3ecb79; --warn:#e0a33a; --warn-weak:#33280f; --bad:#ef6b6b; --shadow:0 14px 40px rgba(0,0,0,.55),0 2px 10px rgba(0,0,0,.4); }}
 :host([data-theme="dark"]){
   --surface:#161c26; --surface-2:#1d2430; --surface-3:#242c39; --border:#2a3340; --border-2:#222a35;
-  --fg:#e7ebf1; --fg-dim:#9aa6b7; --fg-faint:#6b7585;
-  --accent:#2ad2c4; --accent-weak:#11312f; --accent-fg:#052321;
-  --good:#3ecb79; --warn:#e0a33a; --warn-weak:#33280f; --bad:#ef6b6b;
-  --shadow:0 14px 40px rgba(0,0,0,.55),0 2px 10px rgba(0,0,0,.4); }
+  --fg:#e7ebf1; --fg-dim:#9aa6b7; --fg-faint:#6b7585; --accent:#2ad2c4; --accent-weak:#11312f; --accent-fg:#052321;
+  --good:#3ecb79; --warn:#e0a33a; --warn-weak:#33280f; --bad:#ef6b6b; --shadow:0 14px 40px rgba(0,0,0,.55),0 2px 10px rgba(0,0,0,.4); }
 *{box-sizing:border-box}
-.panel{position:fixed;top:16px;right:16px;width:360px;max-width:calc(100vw - 24px);
-  background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);
-  font-family:var(--font);font-size:calc(13px*var(--fs));z-index:2147483646;display:flex;flex-direction:column;max-height:calc(100vh - 32px)}
+.panel{position:fixed;top:16px;right:16px;width:360px;max-width:calc(100vw - 24px);background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);font-family:var(--font);font-size:calc(13px*var(--fs));z-index:2147483646;display:flex;flex-direction:column;max-height:calc(100vh - 32px)}
 .panel.off{filter:grayscale(.6) opacity(.72)}
 .hd{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:grab;user-select:none;background:linear-gradient(var(--surface-2),var(--surface));border-bottom:1px solid var(--border-2);touch-action:none}
 .brand{display:flex;align-items:center;gap:8px;font-weight:600}
@@ -342,10 +388,15 @@
 .logitem .la{font-size:calc(13px*var(--fs));font-weight:600;display:flex;align-items:center;gap:7px}
 .logitem .meta{font-family:var(--mono);font-size:calc(10px*var(--fs));color:var(--fg-faint);display:flex;gap:8px}
 .dotok{width:7px;height:7px;border-radius:50%;background:var(--good)}
+.chat{display:flex;flex-direction:column;gap:8px;max-height:220px;overflow-y:auto}
+.msg{max-width:88%;padding:8px 11px;border-radius:12px;font-size:calc(12.5px*var(--fs));line-height:1.4}
+.msg.ai{align-self:flex-start;background:var(--surface-2);border:1px solid var(--border-2);border-bottom-left-radius:4px}
+.msg.me{align-self:flex-end;background:var(--accent);color:var(--accent-fg);border-bottom-right-radius:4px}
+.chatbar{display:flex;gap:6px;margin-top:2px}
 .field{display:flex;flex-direction:column;gap:6px}
 .field label{font-size:calc(11.5px*var(--fs));color:var(--fg-dim);font-weight:600}
 .row{display:flex;align-items:center;justify-content:space-between;gap:10px}
-select,.input{width:100%;border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:8px;padding:7px 9px;font-size:calc(12.5px*var(--fs));font-family:var(--font)}
+select,.input{width:100%;min-width:0;border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:8px;padding:7px 9px;font-size:calc(12.5px*var(--fs));font-family:var(--font)}
 textarea.input{min-height:60px;resize:vertical}
 .seg{display:flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
 .seg button{flex:1;border:none;background:var(--surface);color:var(--fg-dim);padding:7px 4px;font-size:calc(11.5px*var(--fs));font-weight:600;cursor:pointer;font-family:var(--font)}
@@ -356,7 +407,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .toggle[aria-pressed="true"]{background:var(--accent);border-color:var(--accent)}
 .toggle[aria-pressed="true"]::after{transform:translateX(16px);background:#fff}
 .hint{font-size:calc(10.5px*var(--fs));color:var(--fg-faint);line-height:1.4}
-.phase{font-family:var(--mono);font-size:calc(10px*var(--fs));color:var(--warn);background:var(--warn-weak);border:1px solid color-mix(in srgb,var(--warn) 30%,transparent);padding:2px 7px;border-radius:6px;align-self:flex-start}
+.aistat{font-family:var(--mono);font-size:calc(10.5px*var(--fs));padding:2px 7px;border-radius:6px;border:1px solid var(--border)}
 .collapsed .body,.collapsed .tabs,.collapsed .tabwrap{display:none}
 @media (max-width:440px){.panel{left:12px;right:12px;width:auto;max-width:none}}
 </style>
@@ -375,13 +426,13 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     <div class="sec" id="qsec">
       <div class="eyebrow">Current question</div>
       <div class="chips" id="chips"></div>
-      <div class="qtext" id="qtext">—</div>
+      <div class="qtext" id="qtext">&mdash;</div>
     </div>
     <div class="sec" id="ansSec">
       <div class="ans">
-        <div class="ans-head"><span class="eyebrow" style="margin:0">Proposed answer</span><span class="tier" id="tier">—</span></div>
+        <div class="ans-head"><span class="eyebrow" style="margin:0">Proposed answer</span><span class="tier" id="tier">&mdash;</span></div>
         <textarea class="ans-val" id="ansVal" rows="1" aria-label="Proposed answer"></textarea>
-        <div class="count" id="countRow"><span id="countTxt">—</span><span class="bar"><i id="countBar"></i></span></div>
+        <div class="count" id="countRow"><span id="countTxt">&mdash;</span><span class="bar"><i id="countBar"></i></span></div>
         <div class="btns">
           <button class="btn primary" id="submit">Submit now</button>
           <button class="btn" id="regen">Regenerate</button>
@@ -399,54 +450,71 @@ input[type=range]{width:100%;accent-color:var(--accent)}
   </nav>
   <div class="tabwrap">
     <div data-panel="log"><div class="log" id="log"><div class="hint">Answers will appear here.</div></div></div>
-    <div data-panel="chat" hidden><span class="phase">PHASE 3</span><p class="hint">Direct chat with the AI arrives with the AI brain (Puter/Groq). Offline mode can't chat.</p></div>
+    <div data-panel="chat" hidden>
+      <div class="chat" id="chat"><div class="msg ai">Ask me about the current question, or anything about today's topic.</div></div>
+      <div class="chatbar"><input class="input" id="chatIn" placeholder="Message the assistant…"><button class="btn primary" id="chatSend" style="flex:0 0 auto;min-width:0">Send</button></div>
+    </div>
     <div data-panel="ctx" hidden>
-      <div class="field"><label for="ctxBox">Today's topic / context <span class="hint">(steers offline + AI answers)</span></label>
+      <div class="field"><label for="ctxBox">Today's topic / context <span class="hint">(steers answers)</span></label>
         <textarea class="input" id="ctxBox" placeholder="e.g. thyroid — hypothyroidism, Hashimoto, histology"></textarea></div>
-      <div class="hint">No reliable auto-topic (session titles are often random), so set it here when you can.</div>
+      <div class="hint">Session titles are usually not descriptive, so set the topic here when you can.</div>
     </div>
     <div data-panel="set" hidden>
-      <div class="field"><label>Theme</label><div class="seg" id="themeSeg">
-        <button data-v="light">Light</button><button data-v="dark">Dark</button><button data-v="auto">Auto</button></div></div>
-      <div class="field"><div class="row"><label for="fs">Text size</label><span class="hint" id="fsVal">100%</span></div>
-        <input type="range" id="fs" min="85" max="130" step="5" value="100"></div>
-      <div class="field"><label for="model">AI model <span class="phase">PHASE 3</span></label>
-        <select id="model"><option>Offline pools only</option><option>Puter · GPT-4o-mini (vision)</option><option>Puter · Gemini Flash (vision)</option><option>Groq · Llama-4 Scout (vision)</option></select></div>
-      <div class="field"><label for="key">Groq API key <span class="hint">(optional, Phase 3; device-only)</span></label><input class="input" id="key" type="password" placeholder="gsk_…"></div>
+      <div class="row"><label>AI status</label><span class="aistat" id="aiStat">checking…</span></div>
+      <button class="btn" id="connect" style="flex:0 0 auto">Connect AI (sign in to Puter)</button>
+      <div class="field"><label>Theme</label><div class="seg" id="themeSeg"><button data-v="light">Light</button><button data-v="dark">Dark</button><button data-v="auto">Auto</button></div></div>
+      <div class="field"><div class="row"><label for="fs">Text size</label><span class="hint" id="fsVal">100%</span></div><input type="range" id="fs" min="85" max="130" step="5" value="100"></div>
+      <div class="field"><label for="model">AI model</label>
+        <select id="model"><option>Puter · default</option><option>Puter · GPT-4o-mini (vision)</option><option>Puter · Gemini Flash (vision)</option><option>Offline pools only</option></select></div>
       <div class="row"><label>Auto-submit answers</label><button class="toggle" id="tAuto"></button></div>
-      <div class="row"><label>Use AI for multiple-choice <span class="phase">P3</span></label><button class="toggle" id="tMCQ"></button></div>
+      <div class="row"><label>Use AI for multiple-choice</label><button class="toggle" id="tMCQ"></button></div>
       <div class="row"><label>Confirm before submit</label><button class="toggle" id="tConfirm"></button></div>
-      <div class="hint">v0.1: auto-submit is OFF by default — confirm it detects your polls, then turn it on. MCQ picks a random option (offline); AI answers arrive in Phase 3.</div>
+      <div class="hint">Auto-submit is OFF by default — confirm detection first, then enable it. AI reads the question (text or slide image) via Puter; if Puter is blocked/slow it falls back to offline pools.</div>
     </div>
   </div>
 </section>`;
     }
 
     // ==========================================================================
-    // 4. PANEL WIRING
+    // 5. PANEL WIRING
     // ==========================================================================
     function setState(s, t) { $('#state').setAttribute('data-s', s); $('#stateTxt').textContent = t; }
     function autosize(t) { t.style.height = 'auto'; t.style.height = Math.min(120, t.scrollHeight) + 'px'; }
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-    // reflect persisted settings into the UI
     $$('#themeSeg button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === S.theme ? 'true' : 'false'));
     $('#fs').value = Math.round(S.fontScale * 100); $('#fsVal').textContent = Math.round(S.fontScale * 100) + '%';
-    $('#ctxBox').value = S.topic; $('#key').value = S.groqKey; $('#model').value = S.model;
+    $('#ctxBox').value = S.topic; $('#model').value = S.model;
     $('#tAuto').setAttribute('aria-pressed', S.autoSubmit ? 'true' : 'false');
     $('#tMCQ').setAttribute('aria-pressed', S.aiForMCQ ? 'true' : 'false');
     $('#tConfirm').setAttribute('aria-pressed', S.confirm ? 'true' : 'false');
     if (!S.power) { $('#panel').classList.add('off'); setState('off', 'Off'); }
+
+    function refreshAiStatus() {
+        const el = $('#aiStat'); if (!el) return;
+        if (S.model === 'Offline pools only') { el.textContent = 'offline mode'; el.style.color = 'var(--fg-dim)'; }
+        else if (puterReady()) { el.textContent = 'Puter ready'; el.style.color = 'var(--good)'; }
+        else { el.textContent = 'Puter not loaded (CSP?)'; el.style.color = 'var(--bad)'; }
+    }
+    setTimeout(refreshAiStatus, 1500); setTimeout(refreshAiStatus, 5000);
 
     $('#themeSeg').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return;
         $$('#themeSeg button').forEach(x => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
         saveSetting('theme', b.dataset.v); applyTheme(b.dataset.v); });
     $('#fs').addEventListener('input', e => { const f = e.target.value / 100; saveSetting('fontScale', f); applyFont(f); $('#fsVal').textContent = e.target.value + '%'; });
     $('#ctxBox').addEventListener('input', e => saveSetting('topic', e.target.value.trim()));
-    $('#key').addEventListener('input', e => saveSetting('groqKey', e.target.value.trim()));
-    $('#model').addEventListener('change', e => saveSetting('model', e.target.value));
+    $('#model').addEventListener('change', e => { saveSetting('model', e.target.value); refreshAiStatus(); });
     const tog = (id, key) => $(id).addEventListener('click', () => { const v = $(id).getAttribute('aria-pressed') !== 'true'; $(id).setAttribute('aria-pressed', v ? 'true' : 'false'); saveSetting(key, v); });
     tog('#tAuto', 'autoSubmit'); tog('#tMCQ', 'aiForMCQ'); tog('#tConfirm', 'confirm');
+
+    $('#connect').addEventListener('click', async function () {
+        this.disabled = true; const old = this.textContent; this.textContent = 'Connecting…';
+        try {
+            if (typeof puter !== 'undefined' && puter.auth && puter.auth.signIn) await puter.auth.signIn();
+            else if (puterReady()) await puter.ai.chat('hi');
+        } catch (e) {}
+        this.disabled = false; this.textContent = old; refreshAiStatus();
+    });
 
     $$('.tab').forEach(t => t.addEventListener('click', () => {
         $$('.tab').forEach(x => x.setAttribute('aria-selected', 'false')); t.setAttribute('aria-selected', 'true');
@@ -460,9 +528,8 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     $('#ansVal').addEventListener('input', function () { autosize(this); });
     $('#submit').addEventListener('click', () => doSubmit(false));
     $('#skip').addEventListener('click', () => { clearCountdown(); current.done = true; setState('idle', 'Skipped'); $('#countTxt').textContent = 'Skipped'; $('#countBar').style.transform = 'scaleX(0)'; });
-    $('#regen').addEventListener('click', () => { if (!current.q && current.mode !== 'mcq') return; proposeAnswer(); });
+    $('#regen').addEventListener('click', () => { if (current.mode) proposeAnswer(); });
 
-    // drag
     (function () {
         const p = $('#panel'), h = $('#drag'); let drag = false, sx, sy, ox, oy;
         h.addEventListener('pointerdown', e => { if (e.target.closest('.iconbtn')) return; drag = true; p.style.right = 'auto';
@@ -472,6 +539,23 @@ input[type=range]{width:100%;accent-color:var(--accent)}
             p.style.top = Math.max(4, Math.min(innerHeight - 40, oy + e.clientY - sy)) + 'px'; });
         h.addEventListener('pointerup', e => { drag = false; try { h.releasePointerCapture(e.pointerId); } catch (_) {} });
     })();
+
+    // chat
+    async function sendChat() {
+        const v = $('#chatIn').value.trim(); if (!v) return;
+        const box = $('#chat');
+        const me = document.createElement('div'); me.className = 'msg me'; me.textContent = v; box.appendChild(me);
+        $('#chatIn').value = ''; box.scrollTop = box.scrollHeight;
+        const ai = document.createElement('div'); ai.className = 'msg ai'; ai.textContent = '…'; box.appendChild(ai); box.scrollTop = box.scrollHeight;
+        let reply;
+        if (puterReady()) {
+            try { const raw = await withTimeout(puter.ai.chat('You are a concise study helper. ' + memoryText() + (S.topic ? 'Topic: ' + S.topic + '. ' : '') + v, {}), AI_TIMEOUT_MS); reply = extractText(raw) || '(no reply)'; }
+            catch (e) { reply = '(AI error — Puter may be blocked here)'; }
+        } else reply = 'AI not available (Puter blocked, or model set to Offline). Use the "Connect AI" button in Settings.';
+        ai.textContent = reply; box.scrollTop = box.scrollHeight;
+    }
+    $('#chatSend').addEventListener('click', sendChat);
+    $('#chatIn').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
 
     function addLog(q, ans, tier) {
         const box = $('#log'); if (box.firstChild && box.firstChild.className === 'hint') box.innerHTML = '';
@@ -484,19 +568,32 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     }
 
     // ==========================================================================
-    // 5. ANSWER FLOW  (hybrid: propose -> countdown -> auto-submit unless overridden)
+    // 6. ANSWER FLOW (hybrid: AI -> propose -> countdown -> auto-submit unless overridden)
     // ==========================================================================
-    let current = { sig: '', mode: null, q: '', num: 0, done: false, choiceEls: [], inputEl: null };
+    let current = { sig: '', mode: null, q: '', num: 0, done: false, choiceEls: [], choiceTexts: [], inputEl: null, answer: null, optionText: '' };
     let countTimer = null;
     function clearCountdown() { if (countTimer) cancelAnimationFrame(countTimer); countTimer = null; }
 
-    function proposeAnswer() {
-        const ans = current.mode === 'mcq'
-            ? { text: '(random choice)', tier: S.aiForMCQ ? 'Offline' : 'Random' }
-            : offlineAnswer(current.q, !!current.q);
-        current.answer = ans;
-        $('#tier').textContent = ans.tier;
-        $('#ansVal').value = ans.text; autosize($('#ansVal'));
+    async function proposeAnswer() {
+        const sigAtStart = current.sig;
+        const imageUrl = current.q ? '' : getSlideImage();
+        const ctx = { mode: current.mode, qText: current.q, choices: current.choiceTexts || [], imageUrl, topic: S.topic };
+        const usingAI = aiEnabled();
+        $('#tier').textContent = usingAI ? (imageUrl ? 'Reading slide…' : 'Thinking…') : 'Offline';
+        $('#ansVal').value = ''; $('#countBar').style.transform = 'scaleX(1)';
+        setState('answering', imageUrl ? 'Reading slide…' : 'Answering…');
+
+        let res = await aiAnswer(ctx);
+        if (sigAtStart !== current.sig) return;              // question changed while we waited
+        if (res) {
+            if (res.question && !current.q) { current.q = res.question; showQuestion(); }  // show what it read off the image
+        } else {
+            const off = offlineAnswer(current.q, !!current.q);
+            res = { text: off.text, tier: (usingAI ? 'Offline (AI failed)' : off.tier) };
+        }
+        current.answer = res; current.optionText = res.text;
+        $('#tier').textContent = res.tier;
+        $('#ansVal').value = res.text; autosize($('#ansVal'));
         startCountdown();
     }
     function startCountdown() {
@@ -518,12 +615,15 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         let ok = false, submittedText = $('#ansVal').value;
         try {
             if (current.mode === 'mcq' && current.choiceEls.length) {
-                const el = current.choiceEls[Math.floor(Math.random() * current.choiceEls.length)];
+                let el = null;
+                const want = (current.optionText || '').toLowerCase().replace(/^\d+[\).]\s*/, '').trim();
+                if (want && S.aiForMCQ) el = current.choiceEls.find(c => { const t = (c.innerText || '').toLowerCase().trim(); return t && (t === want || t.includes(want) || want.includes(t)); });
+                if (!el) el = current.choiceEls[Math.floor(Math.random() * current.choiceEls.length)];
                 const r = el.getBoundingClientRect(); realClick(el, r.left + r.width / 2, r.top + r.height / 2);
-                submittedText = 'Option ' + (current.choiceEls.indexOf(el) + 1); ok = true;
+                submittedText = (el.innerText || '').trim().slice(0, 60) || ('Option ' + (current.choiceEls.indexOf(el) + 1)); ok = true;
             } else if (current.mode === 'text' && current.inputEl) {
                 setNativeValue(current.inputEl, submittedText);
-                setTimeout(() => { const b = findSubmitButton(current.inputEl); if (b && isVisible(b) && !b.disabled) { const r = b.getBoundingClientRect(); realClick(b, r.left + r.width / 2, r.top + r.height / 2); } }, 300);
+                setTimeout(() => { try { const b = findSubmitButton(current.inputEl); if (b && isVisible(b) && !b.disabled) { const r = b.getBoundingClientRect(); realClick(b, r.left + r.width / 2, r.top + r.height / 2); } } catch (e) {} }, 300);
                 ok = true;
             }
         } catch (e) {}
@@ -531,32 +631,26 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         setState('answered', ok ? (auto ? 'Answered ✓' : 'Submitted') : 'Could not submit');
         $('#countTxt').textContent = ok ? 'Submitted' : 'Submit failed — try manually';
         $('#countBar').style.transform = 'scaleX(0)';
-        if (ok) addLog(current.q, submittedText, current.answer ? current.answer.tier : '—');
+        if (ok) { addLog(current.q, submittedText, current.answer ? current.answer.tier : '—'); rememberQA(current.q, submittedText); }
     }
 
     // ==========================================================================
-    // 6. SCAN LOOP
+    // 7. SCAN LOOP
     // ==========================================================================
     setInterval(() => {
-        const title = getSessionTitle(); // reserved for future use
         if (!S.power) return;
-
         if (onResultsScreen()) { goIdle(); return; }
-        const choices = getChoices();
-        const inputs = getTextInputs();
+        const choices = getChoices(), inputs = getTextInputs();
         const mode = choices.length ? 'mcq' : inputs.length ? 'text' : null;
-
         if (!mode) { goIdle(); return; }
 
-        // signature so we only react once per distinct question
         const q = getQuestionText();
         const sig = mode + '|' + choices.length + '|' + inputs.length + '|' + q.slice(0, 60);
-        if (sig === current.sig) return;        // same question, already handled
-        // new question
+        if (sig === current.sig) return;
         current = { sig, mode, q, num: current.num + 1, done: false,
-            choiceEls: choices, inputEl: inputs[0] || null, answer: null };
+            choiceEls: choices, choiceTexts: choices.map(c => (c.innerText || '').trim()).filter(Boolean),
+            inputEl: inputs[0] || null, answer: null, optionText: '' };
 
-        // if the user already answered manually, lock without acting
         if ((mode === 'mcq' && anySelected(choices)) || (mode === 'text' && inputs.some(i => i.value && i.value.trim()))) {
             current.done = true; showQuestion(); setState('answered', 'Already answered'); $('#countTxt').textContent = 'You answered this one'; return;
         }
@@ -565,7 +659,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     }, SCAN_MS);
 
     function goIdle() {
-        if (current.mode !== null || current.sig !== '') { current = { sig: '', mode: null, q: '', num: current.num, done: false, choiceEls: [], inputEl: null }; }
+        if (current.mode !== null || current.sig !== '') current = { sig: '', mode: null, q: '', num: current.num, done: false, choiceEls: [], choiceTexts: [], inputEl: null, answer: null, optionText: '' };
         clearCountdown();
         $('#qsec').hidden = true; $('#ansSec').hidden = true; $('#idleSec').hidden = false;
         if (S.power && !S.paused) setState('idle', 'Watching slides');
@@ -575,12 +669,10 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         const typeLabel = current.mode === 'mcq' ? 'Multiple choice' : 'Short answer';
         const isImg = !current.q;
         $('#chips').innerHTML = '<span class="chip type">' + typeLabel + '</span>' +
-            '<span class="chip">Q <b>' + current.num + '</b></span>' +
-            '<span class="chip">Case: <b>—</b></span>';
-        const qt = $('#qtext');
-        qt.className = 'qtext' + (isImg ? ' dim' : '');
-        qt.textContent = current.q || '[shown as image / no text on page]';
+            '<span class="chip">Q <b>' + current.num + '</b></span>' + '<span class="chip">Case: <b>—</b></span>';
+        const qt = $('#qtext'); qt.className = 'qtext' + (isImg ? ' dim' : '');
+        qt.textContent = current.q || '[shown as image — reading with AI…]';
     }
 
-    console.log('[AI Poll Assistant] v0.1.0 loaded — offline mode, auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
+    console.log('[AI Poll Assistant] v0.2.0 loaded. Puter at start: ' + (puterReady() ? 'ready' : 'not yet') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
 })();
