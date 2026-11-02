@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Echo360 AI Poll Assistant
 // @namespace    https://github.com/rsharma929/echo360-ai-poll-assistant
-// @version      0.3.0
-// @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with a resizable in-page panel. Reads the question (text OR slide image via Puter vision) and answers MCQ + short answer; offline pools as fallback.
+// @version      0.4.0
+// @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with a resizable in-page panel. Answers MCQ + short answer via Groq (your free key) — reads the question from page text OR the slide image (vision). Offline pools as fallback.
 // @author       Rohan
 // @license      MIT
 // @match        https://*.ttpoll.com/*
@@ -11,8 +11,14 @@
 // @match        https://echo360.com/*
 // @match        https://*.turningtechnologies.com/*
 // @match        https://turningtechnologies.com/*
-// @require      https://js.puter.com/v2/
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      api.groq.com
+// @connect      user-content.turningtechnologies.com
+// @connect      turningtechnologies.com
+// @connect      echo360.com
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/rsharma929/echo360-ai-poll-assistant/main/echo360-ai-poll-assistant.user.js
 // @updateURL    https://raw.githubusercontent.com/rsharma929/echo360-ai-poll-assistant/main/echo360-ai-poll-assistant.user.js
@@ -20,31 +26,32 @@
 
 /*
  * Standalone AI Poll Assistant — NOT pointsolutions-poll-automation.
- * Timing model: if AI is on for the question type, it answers the moment the AI replies
- *   (the AI's own latency is the delay); if the AI exceeds AI_TIMEOUT_MS or errors, it falls
- *   back to offline pools and submits promptly. The random MIN..MAX delay is applied ONLY in
- *   offline-only mode (AI off / blocked) so canned answers don't look instant.
- * Auto-submit is OFF by default — confirm detection, then enable it in Settings.
+ * Brain: Groq (OpenAI-compatible) via GM_xmlhttpRequest — bypasses the site CSP that blocks
+ *   in-page SDKs like Puter. Needs the user's own FREE Groq key (console.groq.com), stored
+ *   on-device. One model handles text AND vision (slide images sent as base64).
+ * One-off per question (stateless). Only case-linked questions get a tiny context blurb.
+ * MCQ -> AI returns only the option (matched + clicked). Short answer -> only a short phrase.
+ * Timing: AI on -> submit the instant it replies; AI slow/fails -> offline promptly; the
+ *   random 0.5-7.5s delay applies ONLY in offline-only mode. Auto-submit OFF by default.
  */
 (function () {
     'use strict';
 
     // ==========================================================================
-    // 0. CONFIG + SETTINGS
+    // 0. CONFIG + SETTINGS (GM storage, with localStorage fallback)
     // ==========================================================================
     const NS = 'ePA_';
     const SCAN_MS = 1000;
-    const MIN_DELAY_MS = 500, MAX_DELAY_MS = 7500;   // offline-only human-like delay
-    const AI_TIMEOUT_MS = 9000;                       // give up on the AI after this, use offline
-    const PUTER_MODELS = {
-        'Puter · default': null,
-        'Puter · GPT-4o-mini (vision)': 'gpt-4o-mini',
-        'Puter · Gemini Flash (vision)': 'google/gemini-2.0-flash'
+    const MIN_DELAY_MS = 500, MAX_DELAY_MS = 7500;
+    const AI_TIMEOUT_MS = 9000;
+    const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+    const GROQ_MODELS = {
+        'Groq · Llama-4 Scout (text + vision)': 'meta-llama/llama-4-scout-17b-16e-instruct',
+        'Groq · Llama-3.3-70B (text only, fast)': 'llama-3.3-70b-versatile'
     };
-    const BASE_SYSTEM = 'You are a concise assistant helping a student during a live medical-school ' +
-        'class poll (preclinical / basic sciences: anatomy, physiology, biochemistry, pharmacology, ' +
-        'microbiology, pathology, histology). Answers need not be certain or fully correct — be brief ' +
-        'and plausible, and never say you do not know.';
+    const BASE_SYSTEM = 'You help a student answer a live medical-school class poll quickly ' +
+        '(preclinical / basic sciences: anatomy, physiology, biochemistry, pharmacology, microbiology, ' +
+        'pathology, histology). Answers need not be certain or fully correct. Be extremely brief.';
 
     const DEFAULT_POOL = ['Supportive care', 'Monitor and reassess', 'Depends on the mechanism',
         'Increased activity', 'Inflammation', 'Negative feedback', 'Homeostasis'];
@@ -68,17 +75,18 @@
         id:      ['Penicillin', 'Gram-positive cocci', 'Vancomycin', 'Sepsis', 'Endotoxin']
     };
 
+    const store = {
+        get(k, d) { try { if (typeof GM_getValue !== 'undefined') { const v = GM_getValue(NS + k, '\u0000'); return v === '\u0000' ? d : v; } const s = localStorage.getItem(NS + k); return s === null ? d : JSON.parse(s); } catch (e) { return d; } },
+        set(k, v) { try { if (typeof GM_setValue !== 'undefined') GM_setValue(NS + k, v); else localStorage.setItem(NS + k, JSON.stringify(v)); } catch (e) {} }
+    };
     const DEFAULTS = {
         power: true, paused: false, autoSubmit: false, aiForMCQ: true, aiForText: true,
-        theme: 'auto', fontScale: 1, model: 'Puter · default', topic: '', panelW: 0, panelH: 0
+        theme: 'auto', fontScale: 1, model: 'Groq · Llama-4 Scout (text + vision)', topic: '',
+        groqKey: '', panelW: 0, panelH: 0
     };
-    const S = loadSettings();
-    function loadSettings() {
-        const s = Object.assign({}, DEFAULTS);
-        try { for (const k in DEFAULTS) { const v = localStorage.getItem(NS + k); if (v !== null) s[k] = JSON.parse(v); } } catch (e) {}
-        return s;
-    }
-    function saveSetting(k, v) { S[k] = v; try { localStorage.setItem(NS + k, JSON.stringify(v)); } catch (e) {} }
+    const S = {};
+    for (const k in DEFAULTS) S[k] = store.get(k, DEFAULTS[k]);
+    function saveSetting(k, v) { S[k] = v; store.set(k, v); }
     const rint = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo + 1));
 
     // ==========================================================================
@@ -127,7 +135,8 @@
     }
     function isBadInput(el) { if (el.disabled || el.tagName === 'IFRAME') return true; return isChatSupport(el); }
     function setNativeValue(el, value) {
-        const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+        const win = el.ownerDocument.defaultView || window;
+        const proto = el.tagName === 'TEXTAREA' ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
         const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
         setter.call(el, value);
         el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -253,58 +262,67 @@
     }
 
     // ==========================================================================
-    // 3. AI BRAIN (Puter.js — keyless, vision)
+    // 3. AI BRAIN (Groq via GM_xmlhttpRequest — bypasses CSP; text + vision)
     // ==========================================================================
     let memory = [];
-    function rememberQA(q, a) { if (q || a) { memory.push('Q: ' + (q || '[image]') + ' | A: ' + a); if (memory.length > 8) memory.shift(); } updateMemoryView(); }
-    function memoryText() { return memory.length ? 'Earlier questions this session:\n' + memory.join('\n') + '\n\n' : ''; }
-    function puterReady() { try { return typeof puter !== 'undefined' && puter && puter.ai && typeof puter.ai.chat === 'function'; } catch (e) { return false; } }
-    function aiOn() { return S.model !== 'Offline pools only' && puterReady(); }
+    function rememberQA(q, a) { if (q || a) { memory.push('Q: ' + (q || '[image]') + ' | A: ' + a); if (memory.length > 6) memory.shift(); } updateMemoryView(); }
+    function hasKey() { return !!(S.groqKey && S.groqKey.length > 10); }
+    function aiOn() { return S.model !== 'Offline pools only' && hasKey(); }
     function aiForType(mode) { return aiOn() && (mode === 'mcq' ? S.aiForMCQ : S.aiForText); }
+    function isCaseQuestion(q) { return /\b(this patient|the patient|patient'?s|the above|same patient|this case|continues|previously|as described|in the vignette)\b/i.test(q || ''); }
     function withTimeout(p, ms) { return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]); }
-    function extractText(r) {
-        if (!r) return '';
-        if (typeof r === 'string') return r;
-        if (r.message && r.message.content) { const c = r.message.content; return typeof c === 'string' ? c : (Array.isArray(c) && c[0] && c[0].text) || ''; }
-        if (typeof r.text === 'string') return r.text;
-        if (typeof r.content === 'string') return r.content;
-        try { return String(r); } catch (e) { return ''; }
+
+    function gmRequest(opts) {
+        return new Promise((resolve, reject) => {
+            const fn = (typeof GM_xmlhttpRequest !== 'undefined') ? GM_xmlhttpRequest
+                : (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? GM.xmlHttpRequest : null;
+            if (!fn) return reject(new Error('GM_xmlhttpRequest unavailable'));
+            try { fn(Object.assign({ onload: resolve, onerror: () => reject(new Error('network')), ontimeout: () => reject(new Error('timeout')) }, opts)); }
+            catch (e) { reject(e); }
+        });
     }
-    function parseQA(t) {
-        const qm = t.match(/QUESTION:\s*([\s\S]*?)(?:\n|$)/i);
-        const am = t.match(/ANSWER:\s*([\s\S]*)/i);
-        return { q: qm ? qm[1].trim() : '', a: am ? am[1].trim().split('\n')[0].trim() : '' };
+    async function groqChat(messages) {
+        if (!hasKey()) throw new Error('no key');
+        const model = GROQ_MODELS[S.model] || 'meta-llama/llama-4-scout-17b-16e-instruct';
+        const r = await gmRequest({
+            method: 'POST', url: GROQ_URL, timeout: AI_TIMEOUT_MS,
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + S.groqKey },
+            data: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 100 })
+        });
+        if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' ' + (r.responseText || '').slice(0, 140));
+        const j = JSON.parse(r.responseText);
+        return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
     }
-    function buildPrompt(ctx) {
-        let p = BASE_SYSTEM + '\n\n';
-        if (ctx.topic) p += "Today's topic: " + ctx.topic + '. ';
-        p += memoryText();
-        if (ctx.mode === 'mcq' && ctx.choices.length) {
-            p += 'This is a multiple-choice question. Options:\n' + ctx.choices.map((c, i) => (i + 1) + '. ' + c).join('\n') + '\n';
-            p += ctx.qText ? ('Question: ' + ctx.qText + '\n') : 'The question may be in the attached image.\n';
-            p += 'Reply in EXACTLY two lines:\nQUESTION: <the question in a few words>\nANSWER: <the exact text of the single best option above>';
-        } else {
-            p += ctx.qText ? ('Question: ' + ctx.qText + '\n') : 'The question is in the attached image — read it.\n';
-            p += 'Reply in EXACTLY two lines:\nQUESTION: <the question in a few words>\nANSWER: <a concise word or short phrase>';
-        }
-        return p;
+    async function fetchImageDataUrl(url) {
+        const r = await gmRequest({ method: 'GET', url, responseType: 'blob', timeout: AI_TIMEOUT_MS });
+        if (r.status && (r.status < 200 || r.status >= 300)) throw new Error('img HTTP ' + r.status);
+        const blob = r.response; if (!blob) throw new Error('no blob');
+        if (blob.size > 3.8 * 1024 * 1024) throw new Error('image too large');
+        return await new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => rej(new Error('read fail')); fr.readAsDataURL(blob); });
     }
+    function cleanAnswer(t) { return (t || '').trim().split('\n')[0].trim().replace(/^["'`*\s]+|["'`*\s]+$/g, '').replace(/^(answer|ans)[:\-]\s*/i, '').trim(); }
+
     async function aiAnswer(ctx) {
         if (!aiForType(ctx.mode)) return null;
-        const prompt = buildPrompt(ctx);
-        const modelId = PUTER_MODELS[S.model];
-        const call = (useModel) => {
-            const opts = useModel && modelId ? { model: modelId } : {};
-            return ctx.imageUrl ? puter.ai.chat(prompt, ctx.imageUrl, opts) : puter.ai.chat(prompt, opts);
-        };
         try {
-            const raw = await withTimeout(Promise.resolve().then(() => call(true)).catch(() => call(false)), AI_TIMEOUT_MS);
-            const txt = extractText(raw);
+            let imgDataUrl = null;
+            if (ctx.imageUrl) { try { imgDataUrl = await fetchImageDataUrl(ctx.imageUrl); } catch (e) { imgDataUrl = null; } }
+            if (!ctx.qText && !imgDataUrl) return null;   // nothing readable -> fall back
+            const blurb = ctx.caseBlurb ? ctx.caseBlurb + '\n' : '';
+            let userText;
+            if (ctx.mode === 'mcq' && ctx.choices.length) {
+                userText = blurb + 'Multiple-choice question.\nOptions:\n' + ctx.choices.map((c, i) => (i + 1) + '. ' + c).join('\n') + '\n' +
+                    (ctx.qText ? ('Question: ' + ctx.qText) : 'The question is in the image.') +
+                    '\nReply with ONLY the exact text of the single best option above. No other words.';
+            } else {
+                userText = blurb + (ctx.qText ? ('Question: ' + ctx.qText) : 'The question is in the image — read it.') +
+                    '\nReply with ONLY the answer: one word or a short phrase. No other words.';
+            }
+            const content = imgDataUrl ? [{ type: 'text', text: userText }, { type: 'image_url', image_url: { url: imgDataUrl } }] : userText;
+            const messages = [{ role: 'system', content: BASE_SYSTEM }, { role: 'user', content }];
+            const txt = cleanAnswer(await withTimeout(groqChat(messages), AI_TIMEOUT_MS + 1500));
             if (!txt) return null;
-            const parsed = parseQA(txt);
-            const answer = parsed.a || txt.trim().split('\n')[0].slice(0, 120);
-            if (!answer) return null;
-            return { question: parsed.q, text: answer, tier: 'Puter' + (ctx.imageUrl ? ' · vision' : '') };
+            return { text: txt.slice(0, 160), tier: 'Groq' + (imgDataUrl ? ' · vision' : '') };
         } catch (e) { return null; }
     }
 
@@ -363,6 +381,7 @@
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chip{font-size:calc(11px*var(--fs));font-family:var(--mono);padding:3px 8px;border-radius:7px;border:1px solid var(--border);background:var(--surface-2);color:var(--fg-dim)}
 .chip.type{background:var(--accent-weak);border-color:color-mix(in srgb,var(--accent) 35%,transparent);color:color-mix(in srgb,var(--accent) 72%,var(--fg))}
+.chip.cas{background:var(--warn-weak);border-color:color-mix(in srgb,var(--warn) 30%,transparent);color:color-mix(in srgb,var(--warn) 80%,var(--fg))}
 .chip b{color:var(--fg)}
 .qtext{font-size:calc(14px*var(--fs));line-height:1.4;font-weight:500}
 .qtext.dim{font-family:var(--mono);font-size:calc(12px*var(--fs));color:var(--fg-dim);font-weight:400}
@@ -401,6 +420,7 @@
 .row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 select,.input{width:100%;min-width:0;border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:8px;padding:7px 9px;font-size:calc(12.5px*var(--fs));font-family:var(--font)}
 textarea.input{min-height:60px;resize:vertical}
+a.lnk{color:var(--accent);text-decoration:none}
 .seg{display:flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
 .seg button{flex:1;border:none;background:var(--surface);color:var(--fg-dim);padding:7px 4px;font-size:calc(11.5px*var(--fs));font-weight:600;cursor:pointer;font-family:var(--font)}
 .seg button[aria-pressed="true"]{background:var(--accent);color:var(--accent-fg)}
@@ -458,7 +478,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <div class="log" id="log"><div class="hint">No answers yet.</div></div>
     </div>
     <div data-panel="chat" hidden>
-      <div class="hint" style="margin-bottom:4px">A side chat for you — ask about the current question or today's topic. (This is separate from the automatic answering.)</div>
+      <div class="hint" style="margin-bottom:4px">A side chat for you — ask about the current question or topic. (Separate from the automatic answering.)</div>
       <div class="chat" id="chat"><div class="msg ai">Ask me anything about the current question or topic.</div></div>
       <div class="chatbar"><input class="input" id="chatIn" placeholder="Message the assistant…"><button class="btn primary" id="chatSend" style="flex:0 0 auto;min-width:0">Send</button></div>
     </div>
@@ -471,16 +491,18 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     </div>
     <div data-panel="set" hidden>
       <div class="row"><label>AI status</label><span class="aistat" id="aiStat">checking…</span></div>
-      <button class="btn" id="connect" style="flex:0 0 auto">Connect AI (sign in to Puter)</button>
+      <div class="field"><label for="key">Groq API key <span class="hint">— free at <a class="lnk" href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com</a>; stored on this device only</span></label>
+        <input class="input" id="key" type="password" placeholder="gsk_…"></div>
+      <button class="btn" id="test" style="flex:0 0 auto">Test AI</button>
       <div class="field"><label>Theme</label><div class="seg" id="themeSeg"><button data-v="light">Light</button><button data-v="dark">Dark</button><button data-v="auto">Auto</button></div></div>
       <div class="field"><div class="row"><label for="fs">Text size</label><span class="hint" id="fsVal">100%</span></div><input type="range" id="fs" min="80" max="140" step="5" value="100"></div>
       <div class="hint">Drag the panel's bottom-right corner to resize it.</div>
       <div class="field"><label for="model">AI model</label>
-        <select id="model"><option>Puter · default</option><option>Puter · GPT-4o-mini (vision)</option><option>Puter · Gemini Flash (vision)</option><option>Offline pools only</option></select></div>
+        <select id="model"><option>Groq · Llama-4 Scout (text + vision)</option><option>Groq · Llama-3.3-70B (text only, fast)</option><option>Offline pools only</option></select></div>
       <div class="row"><label>Auto-submit answers</label><button class="toggle" id="tAuto"></button></div>
       <div class="row"><label>AI for multiple-choice</label><button class="toggle" id="tMCQ"></button></div>
       <div class="row"><label>AI for short answer</label><button class="toggle" id="tText"></button></div>
-      <div class="hint">When AI is on for a type, it answers as soon as the AI replies; if the AI is too slow or fails, it falls back to offline pools. Turn AI off for a type to use offline only (with a short random delay so it isn't instant). Auto-submit OFF = it only proposes; you press Submit.</div>
+      <div class="hint">AI answers as soon as it replies; if it's too slow or fails it falls back to offline. Turn AI off for a type to use offline only (with a short random delay). Auto-submit OFF = it only proposes; you press Submit.</div>
     </div>
   </div>
 </section>`;
@@ -494,13 +516,11 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
     function updateMemoryView() { const el = $('#memView'); if (el) el.textContent = memory.length ? memory.join('\n') : 'nothing yet'; }
 
-    // restore persisted size
     if (S.panelW > 0) $('#panel').style.width = S.panelW + 'px';
     if (S.panelH > 0) $('#panel').style.height = S.panelH + 'px';
-
     $$('#themeSeg button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === S.theme ? 'true' : 'false'));
     $('#fs').value = Math.round(S.fontScale * 100); $('#fsVal').textContent = Math.round(S.fontScale * 100) + '%';
-    $('#ctxBox').value = S.topic; $('#model').value = S.model;
+    $('#ctxBox').value = S.topic; $('#model').value = S.model; $('#key').value = S.groqKey;
     $('#tAuto').setAttribute('aria-pressed', S.autoSubmit ? 'true' : 'false');
     $('#tMCQ').setAttribute('aria-pressed', S.aiForMCQ ? 'true' : 'false');
     $('#tText').setAttribute('aria-pressed', S.aiForText ? 'true' : 'false');
@@ -509,32 +529,27 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     function refreshAiStatus() {
         const el = $('#aiStat'); if (!el) return;
         if (S.model === 'Offline pools only') { el.textContent = 'offline mode'; el.style.color = 'var(--fg-dim)'; }
-        else if (puterReady()) { el.textContent = 'Puter ready'; el.style.color = 'var(--good)'; }
-        else if (typeof puter === 'undefined') { el.textContent = 'Puter did NOT load (CSP?)'; el.style.color = 'var(--bad)'; }
-        else { el.textContent = 'Puter loaded, not ready'; el.style.color = 'var(--warn)'; }
+        else if (!hasKey()) { el.textContent = 'no API key set'; el.style.color = 'var(--warn)'; }
+        else { el.textContent = 'key set — click Test'; el.style.color = 'var(--fg-dim)'; }
     }
-    setTimeout(refreshAiStatus, 1500); setTimeout(refreshAiStatus, 5000);
+    refreshAiStatus();
 
     $('#themeSeg').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return;
         $$('#themeSeg button').forEach(x => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
         saveSetting('theme', b.dataset.v); applyTheme(b.dataset.v); });
     $('#fs').addEventListener('input', e => { const f = e.target.value / 100; saveSetting('fontScale', f); applyFont(f); $('#fsVal').textContent = e.target.value + '%'; });
     $('#ctxBox').addEventListener('input', e => saveSetting('topic', e.target.value.trim()));
+    $('#key').addEventListener('input', e => { saveSetting('groqKey', e.target.value.trim()); refreshAiStatus(); });
     $('#model').addEventListener('change', e => { saveSetting('model', e.target.value); refreshAiStatus(); });
     const tog = (id, key) => $(id).addEventListener('click', () => { const v = $(id).getAttribute('aria-pressed') !== 'true'; $(id).setAttribute('aria-pressed', v ? 'true' : 'false'); saveSetting(key, v); });
     tog('#tAuto', 'autoSubmit'); tog('#tMCQ', 'aiForMCQ'); tog('#tText', 'aiForText');
 
-    $('#connect').addEventListener('click', async function () {
+    $('#test').addEventListener('click', async function () {
         const note = $('#aiStat');
-        if (typeof puter === 'undefined') { note.textContent = 'Puter.js not loaded — blocked by the site'; note.style.color = 'var(--bad)'; return; }
-        this.disabled = true; const old = this.textContent; this.textContent = 'Connecting…';
-        try {
-            if (puter.auth && puter.auth.signIn) await puter.auth.signIn();
-            else if (puterReady()) await puter.ai.chat('hi');
-            let signed = true;
-            try { if (puter.auth && puter.auth.isSignedIn) signed = !!puter.auth.isSignedIn(); } catch (e) {}
-            note.textContent = signed ? 'Puter connected ✓' : 'Puter ready'; note.style.color = 'var(--good)';
-        } catch (e) { note.textContent = 'Puter sign-in failed: ' + (e && e.message ? e.message : 'error'); note.style.color = 'var(--bad)'; }
+        if (!hasKey()) { note.textContent = 'enter a key first'; note.style.color = 'var(--warn)'; return; }
+        this.disabled = true; const old = this.textContent; this.textContent = 'Testing…'; note.textContent = 'testing…'; note.style.color = 'var(--fg-dim)';
+        try { const r = cleanAnswer(await groqChat([{ role: 'user', content: 'Reply with the word OK.' }])); note.textContent = r ? 'AI working ✓' : 'empty reply'; note.style.color = r ? 'var(--good)' : 'var(--warn)'; }
+        catch (e) { note.textContent = 'failed: ' + (e && e.message ? e.message : 'error'); note.style.color = 'var(--bad)'; }
         this.disabled = false; this.textContent = old;
     });
 
@@ -551,17 +566,15 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     $('#submit').addEventListener('click', () => doSubmit(false));
     $('#regen').addEventListener('click', () => { if (current.mode) handleQuestion(); });
 
-    // drag
     (function () {
         const p = $('#panel'), h = $('#drag'); let drag = false, sx, sy, ox, oy;
         h.addEventListener('pointerdown', e => { if (e.target.closest('.iconbtn')) return; drag = true; p.style.right = 'auto';
             const r = p.getBoundingClientRect(); ox = r.left; oy = r.top; sx = e.clientX; sy = e.clientY; p.style.left = ox + 'px'; p.style.top = oy + 'px'; h.setPointerCapture(e.pointerId); });
         h.addEventListener('pointermove', e => { if (!drag) return;
-            p.style.left = Math.max(4, Math.min(innerWidth - 60, ox + e.clientX - sx)) + 'px';
-            p.style.top = Math.max(4, Math.min(innerHeight - 40, oy + e.clientY - sy)) + 'px'; });
+            p.style.left = Math.max(4, Math.min(window.innerWidth - 60, ox + e.clientX - sx)) + 'px';
+            p.style.top = Math.max(4, Math.min(window.innerHeight - 40, oy + e.clientY - sy)) + 'px'; });
         h.addEventListener('pointerup', e => { drag = false; try { h.releasePointerCapture(e.pointerId); } catch (_) {} });
     })();
-    // persist size on resize
     (function () {
         const p = $('#panel'); let tmr = null;
         if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => {
@@ -570,7 +583,6 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         }).observe(p);
     })();
 
-    // chat
     async function sendChat() {
         const v = $('#chatIn').value.trim(); if (!v) return;
         const box = $('#chat');
@@ -578,11 +590,12 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         $('#chatIn').value = ''; box.scrollTop = box.scrollHeight;
         const ai = document.createElement('div'); ai.className = 'msg ai'; ai.textContent = '…'; box.appendChild(ai); box.scrollTop = box.scrollHeight;
         let reply;
-        if (puterReady()) {
+        if (hasKey()) {
             const ctxLine = current.q ? ('Current question on screen: ' + current.q + '\n') : '';
-            try { const raw = await withTimeout(puter.ai.chat(BASE_SYSTEM + '\n' + (S.topic ? 'Topic: ' + S.topic + '. ' : '') + memoryText() + ctxLine + 'User: ' + v, {}), AI_TIMEOUT_MS); reply = extractText(raw) || '(no reply)'; }
-            catch (e) { reply = '(AI error — Puter may be blocked here)'; }
-        } else reply = 'AI not available (Puter blocked, or model = Offline). Try "Connect AI" in Settings.';
+            const sys = BASE_SYSTEM + (S.topic ? ' Topic: ' + S.topic + '.' : '');
+            try { reply = cleanAnswer(await groqChat([{ role: 'system', content: sys }, { role: 'user', content: ctxLine + v }])) || '(no reply)'; }
+            catch (e) { reply = 'AI error: ' + (e && e.message ? e.message : 'failed'); }
+        } else reply = 'No Groq key set — add one in Settings to use chat.';
         ai.textContent = reply; box.scrollTop = box.scrollHeight;
     }
     $('#chatSend').addEventListener('click', sendChat);
@@ -601,7 +614,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     // ==========================================================================
     // 6. ANSWER FLOW
     // ==========================================================================
-    let current = { sig: '', mode: null, q: '', num: 0, done: false, choiceEls: [], choiceTexts: [], inputEl: null, answer: null, optionText: '' };
+    let current = { sig: '', mode: null, q: '', num: 0, done: false, isCase: false, choiceEls: [], choiceTexts: [], inputEl: null, answer: null, optionText: '' };
     let countTimer = null;
     function clearCountdown() { if (countTimer) cancelAnimationFrame(countTimer); countTimer = null; }
     function showProposed(text, tier) { $('#tier').textContent = tier; $('#ansVal').value = text; autosize($('#ansVal')); }
@@ -612,29 +625,27 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         if (useAI) {
             const sig = current.sig;
             const imageUrl = current.q ? '' : getSlideImage();
+            const caseBlurb = current.isCase && memory.length ? ('This is part of an ongoing case. Earlier: ' + memory[memory.length - 1] + '.') : '';
             setState('answering', imageUrl ? 'Reading slide…' : 'Thinking…');
             showProposed('', imageUrl ? 'Reading slide…' : 'Thinking…');
             $('#countTxt').textContent = 'Waiting for AI…'; $('#countBar').style.transform = 'scaleX(1)';
-            const res = await aiAnswer({ mode: current.mode, qText: current.q, choices: current.choiceTexts, imageUrl, topic: S.topic });
-            if (sig !== current.sig) return;                       // question changed while waiting
+            const res = await aiAnswer({ mode: current.mode, qText: current.q, choices: current.choiceTexts, imageUrl, caseBlurb });
+            if (sig !== current.sig) return;
             if (res) {
-                if (res.question && !current.q) { current.q = res.question; showQuestion(); }
                 current.answer = res; current.optionText = res.text; showProposed(res.text, res.tier);
-                if (S.autoSubmit) doSubmit(true); else readyAssisted();       // AI done -> answer immediately
+                if (S.autoSubmit) doSubmit(true); else readyAssisted();
                 return;
             }
-            const off = offlineAnswer(current.q, !!current.q);                 // AI failed/timed out -> offline, promptly
+            const off = offlineAnswer(current.q, !!current.q);
             current.answer = { text: off.text, tier: 'Offline (AI failed)' }; current.optionText = off.text;
             showProposed(off.text, current.answer.tier);
             if (S.autoSubmit) doSubmit(true); else readyAssisted();
             return;
         }
-        // offline-only for this type -> human-like random delay when auto-submitting
         const off = offlineAnswer(current.q, !!current.q);
         current.answer = off; current.optionText = off.text; showProposed(off.text, off.tier);
         if (S.autoSubmit) startDelayCountdown(); else readyAssisted();
     }
-
     function startDelayCountdown() {
         clearCountdown();
         if (!S.power || S.paused) { setState('idle', S.paused ? 'Paused' : 'Idle'); $('#countTxt').textContent = S.paused ? 'Paused' : '—'; return; }
@@ -647,7 +658,6 @@ input[type=range]{width:100%;accent-color:var(--accent)}
             if (rem <= 0) { countTimer = null; doSubmit(true); } else countTimer = requestAnimationFrame(loop);
         })(t0);
     }
-
     function doSubmit(auto) {
         clearCountdown();
         if (current.done) return;
@@ -655,7 +665,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         try {
             if (current.mode === 'mcq' && current.choiceEls.length) {
                 let el = null;
-                const want = (current.optionText || '').toLowerCase().replace(/^\d+[\).]\s*/, '').trim();
+                const want = (current.optionText || '').toLowerCase().replace(/^\d+[\).]\s*/, '').replace(/^[a-e][\).]\s*/, '').trim();
                 if (want && S.aiForMCQ) el = current.choiceEls.find(c => { const t = (c.innerText || '').toLowerCase().trim(); return t && (t === want || t.includes(want) || want.includes(t)); });
                 if (!el) el = current.choiceEls[Math.floor(Math.random() * current.choiceEls.length)];
                 const r = el.getBoundingClientRect(); realClick(el, r.left + r.width / 2, r.top + r.height / 2);
@@ -681,7 +691,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         memory = []; updateMemoryView();
         saveSetting('topic', ''); if ($('#ctxBox')) $('#ctxBox').value = '';
         const lb = $('#log'); if (lb) lb.innerHTML = '<div class="hint">New session — log cleared.</div>';
-        current = { sig: '', mode: null, q: '', num: 0, done: false, choiceEls: [], choiceTexts: [], inputEl: null, answer: null, optionText: '' };
+        current = { sig: '', mode: null, q: '', num: 0, done: false, isCase: false, choiceEls: [], choiceTexts: [], inputEl: null, answer: null, optionText: '' };
     }
     setInterval(() => {
         if (!S.power) return;
@@ -696,7 +706,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         const q = getQuestionText();
         const sig = mode + '|' + choices.length + '|' + inputs.length + '|' + q.slice(0, 60);
         if (sig === current.sig) return;
-        current = { sig, mode, q, num: current.num + 1, done: false,
+        current = { sig, mode, q, num: current.num + 1, done: false, isCase: isCaseQuestion(q),
             choiceEls: choices, choiceTexts: choices.map(c => (c.innerText || '').trim()).filter(Boolean),
             inputEl: inputs[0] || null, answer: null, optionText: '' };
 
@@ -708,7 +718,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     }, SCAN_MS);
 
     function goIdle() {
-        if (current.mode !== null || current.sig !== '') current = { sig: '', mode: null, q: '', num: current.num, done: false, choiceEls: [], choiceTexts: [], inputEl: null, answer: null, optionText: '' };
+        if (current.mode !== null || current.sig !== '') current = { sig: '', mode: null, q: '', num: current.num, done: false, isCase: false, choiceEls: [], choiceTexts: [], inputEl: null, answer: null, optionText: '' };
         clearCountdown();
         $('#qsec').hidden = true; $('#ansSec').hidden = true; $('#idleSec').hidden = false;
         if (S.power && !S.paused) setState('idle', 'Watching slides');
@@ -718,11 +728,12 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         const typeLabel = current.mode === 'mcq' ? 'Multiple choice' : 'Short answer';
         const isImg = !current.q;
         $('#chips').innerHTML = '<span class="chip type">' + typeLabel + '</span>' +
-            '<span class="chip">Q <b>' + current.num + '</b></span>' + '<span class="chip">Case: <b>—</b></span>';
+            '<span class="chip">Q <b>' + current.num + '</b></span>' +
+            (current.isCase ? '<span class="chip cas">Case</span>' : '');
         const qt = $('#qtext'); qt.className = 'qtext' + (isImg ? ' dim' : '');
         qt.textContent = current.q || '[shown as image — reading with AI…]';
     }
 
     updateMemoryView();
-    console.log('[AI Poll Assistant] v0.3.0 loaded. Puter at start: ' + (typeof puter === 'undefined' ? 'UNDEFINED (require blocked?)' : (puterReady() ? 'ready' : 'present-not-ready')) + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
+    console.log('[AI Poll Assistant] v0.4.0 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
 })();
