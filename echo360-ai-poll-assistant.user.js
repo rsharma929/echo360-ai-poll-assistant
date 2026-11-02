@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Echo360 AI Poll Assistant
 // @namespace    https://github.com/rsharma929/echo360-ai-poll-assistant
-// @version      0.4.3
+// @version      0.4.4
 // @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with a resizable in-page panel. Answers MCQ + short answer via Groq (your free key) — reads the question from page text OR the slide image (vision). Offline pools as fallback.
 // @author       Rohan
 // @license      MIT
@@ -272,6 +272,8 @@
     function hasKey() { return !!(S.groqKey && S.groqKey.length > 10); }
     function aiOn() { return S.model !== OFFLINE && hasKey(); }
     function aiForType(mode) { return aiOn() && (mode === 'mcq' ? S.aiForMCQ : S.aiForText); }
+    function modelIsVision() { return /vision|scout|maverick|llava|pixtral|gemini|gpt-4o|[-/]4o|qwen[\w.-]*-vl|vl-/i.test(String(S.model)); }
+    function mcqHasContent(texts) { return (texts || []).some(t => t && t.replace(/^[a-z][\).]?\s*/i, '').trim().length > 2); }
     function isCaseQuestion(q) { return /\b(this patient|the patient|patient'?s|the above|same patient|this case|continues|previously|as described|in the vignette)\b/i.test(q || ''); }
     function withTimeout(p, ms) { return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]); }
 
@@ -311,22 +313,27 @@
         try {
             let imgDataUrl = null;
             if (ctx.imageUrl) { try { imgDataUrl = await fetchImageDataUrl(ctx.imageUrl); } catch (e) { imgDataUrl = null; } }
-            if (!ctx.qText && !imgDataUrl) return null;   // nothing readable -> fall back
+            const haveQ = !!(ctx.qText || imgDataUrl);
+            const haveContext = !!(ctx.topic || ctx.hasMemory);
+            if (ctx.mode !== 'mcq' && !haveQ && !haveContext) return null;   // short answer with nothing to go on
             const blurb = ctx.caseBlurb ? ctx.caseBlurb + '\n' : '';
+            const qline = ctx.qText ? ('Question: ' + ctx.qText) : (imgDataUrl ? 'The question is in the attached image — read it.' : '');
             let userText;
             if (ctx.mode === 'mcq' && ctx.choices.length) {
-                userText = blurb + 'Multiple-choice question.\nOptions:\n' + ctx.choices.map((c, i) => (i + 1) + '. ' + c).join('\n') + '\n' +
-                    (ctx.qText ? ('Question: ' + ctx.qText) : 'The question is in the image.') +
+                const ask = qline || ('The question text is not visible' + (ctx.topic ? ("; today's topic is " + ctx.topic) : '') + ' — choose the most plausible option.');
+                userText = blurb + 'Multiple-choice question.\nOptions:\n' + ctx.choices.map((c, i) => (i + 1) + '. ' + c).join('\n') + '\n' + ask +
                     '\nReply with ONLY the exact text of the single best option above. No other words.';
+            } else if (haveQ) {
+                userText = blurb + qline + '\nReply with ONLY the answer: one word or a short phrase. No other words.';
             } else {
-                userText = blurb + (ctx.qText ? ('Question: ' + ctx.qText) : 'The question is in the image — read it.') +
-                    '\nReply with ONLY the answer: one word or a short phrase. No other words.';
+                userText = blurb + 'No question is visible. Give ONE plausible short answer (a term or phrase) related to ' +
+                    (ctx.topic ? ("today's topic: " + ctx.topic) : 'this session so far') + '. No other words.';
             }
             const content = imgDataUrl ? [{ type: 'text', text: userText }, { type: 'image_url', image_url: { url: imgDataUrl } }] : userText;
             const messages = [{ role: 'system', content: BASE_SYSTEM }, { role: 'user', content }];
             const txt = cleanAnswer(await withTimeout(groqChat(messages), AI_TIMEOUT_MS + 1500));
             if (!txt) return null;
-            return { text: txt.slice(0, 160), tier: 'Groq' + (imgDataUrl ? ' · vision' : '') };
+            return { text: txt.slice(0, 160), tier: 'Groq' + (imgDataUrl ? ' · vision' : '') + (!haveQ ? ' · topic' : '') };
         } catch (e) { return null; }
     }
 
@@ -668,16 +675,18 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         if (aiFailed) doSubmit(true); else startDelayCountdown();   // offline-only -> human-like delay; AI-failed -> prompt
     }
     async function handleQuestion() {
+        const img = (current.img && (modelIsVision() || !current.q)) ? current.img : '';
+        // MCQ with no stem, no usable image, and only letter/number options -> nothing to read; just pick randomly.
+        if (current.mode === 'mcq' && !current.q && !img && !mcqHasContent(current.choiceTexts)) { applyOffline(false); return; }
         if (aiForType(current.mode)) {
             const sig = current.sig;
-            const imageUrl = (current.mode === 'text' && !current.q) ? getSlideImage() : '';
             const caseBlurb = current.isCase && memory.length ? ('This is part of an ongoing case. Earlier: ' + memory[memory.length - 1] + '.') : '';
-            setState('answering', imageUrl ? 'Reading slide…' : 'Thinking…');
-            showProposed('', imageUrl ? 'Reading slide…' : 'Thinking…');
+            setState('answering', img ? 'Reading slide…' : 'Thinking…');
+            showProposed('', img ? 'Reading slide…' : 'Thinking…');
             $('#countTxt').textContent = 'Waiting for AI…'; $('#countBar').style.transform = 'scaleX(1)';
-            const res = await aiAnswer({ mode: current.mode, qText: current.q, choices: current.choiceTexts, imageUrl, caseBlurb });
+            const res = await aiAnswer({ mode: current.mode, qText: current.q, choices: current.choiceTexts, imageUrl: img, topic: S.topic, hasMemory: memory.length > 0, caseBlurb });
             if (sig !== current.sig) return;
-            if (res) { current.answer = res; current.optionText = res.text; showProposed(res.text, res.tier); if (S.autoSubmit) doSubmit(true); else readyAssisted(); return; }
+            if (res) { current.answer = res; current.optionText = res.text; showProposed(res.text, res.tier); if (S.autoSubmit) startDelayCountdown(); else readyAssisted(); return; }
             applyOffline(true);
             return;
         }
@@ -743,7 +752,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         const q = getQuestionText();
         const sig = mode + '|' + choices.length + '|' + inputs.length + '|' + q.slice(0, 60);
         if (sig === current.sig) return;
-        current = { sig, mode, q, num: current.num + 1, done: false, isCase: isCaseQuestion(q),
+        current = { sig, mode, q, img: getSlideImage(), num: current.num + 1, done: false, isCase: isCaseQuestion(q),
             choiceEls: choices, choiceTexts: choices.map(c => (c.innerText || '').trim()).filter(Boolean),
             inputEl: inputs[0] || null, answer: null, optionText: '' };
 
@@ -763,14 +772,15 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     function showQuestion() {
         $('#idleSec').hidden = true; $('#qsec').hidden = false; $('#ansSec').hidden = false;
         const typeLabel = current.mode === 'mcq' ? 'Multiple choice' : 'Short answer';
-        const isImg = current.mode === 'text' && !current.q;
         $('#chips').innerHTML = '<span class="chip type">' + typeLabel + '</span>' +
             '<span class="chip">Q <b>' + current.num + '</b></span>' +
-            (current.isCase ? '<span class="chip cas">Case</span>' : '');
+            (current.isCase ? '<span class="chip cas">Case</span>' : '') +
+            (current.img ? '<span class="chip">image</span>' : '');
         const qt = $('#qtext'); qt.className = 'qtext' + (!current.q ? ' dim' : '');
-        qt.textContent = current.q || (isImg ? '[shown as image — reading with AI…]' : '[question text not found — answering from the options]');
+        qt.textContent = current.q || (current.img ? '[shown as image — reading with AI…]'
+            : (current.mode === 'mcq' ? '[question not shown in poll — choosing an option]' : '[no question text — using topic/offline]'));
     }
 
     updateMemoryView();
-    console.log('[AI Poll Assistant] v0.4.3 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
+    console.log('[AI Poll Assistant] v0.4.4 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
 })();
