@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Echo360 AI Poll Assistant
 // @namespace    https://github.com/rsharma929/echo360-ai-poll-assistant
-// @version      0.4.1
+// @version      0.4.2
 // @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with a resizable in-page panel. Answers MCQ + short answer via Groq (your free key) — reads the question from page text OR the slide image (vision). Offline pools as fallback.
 // @author       Rohan
 // @license      MIT
@@ -46,9 +46,9 @@
     const AI_TIMEOUT_MS = 9000;
     const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
     const GROQ_MODELS_URL = 'https://api.groq.com/openai/v1/models';
-    const DEFAULT_MODEL = 'openai/gpt-oss-120b';   // current text default; click "Refresh" to list vision-capable models
+    const DEFAULT_MODEL = 'llama-3.3-70b-versatile';   // reliable non-reasoning text default; click "Refresh" to pick others (incl. vision)
     const OFFLINE = 'offline';
-    const STARTER_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.3-70b-versatile'];
+    const STARTER_MODELS = ['llama-3.3-70b-versatile', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
     const BASE_SYSTEM = 'You help a student answer a live medical-school class poll quickly ' +
         '(preclinical / basic sciences: anatomy, physiology, biochemistry, pharmacology, microbiology, ' +
         'pathology, histology). Answers need not be certain or fully correct. Be extremely brief.';
@@ -87,6 +87,7 @@
     const S = {};
     for (const k in DEFAULTS) S[k] = store.get(k, DEFAULTS[k]);
     if (S.model !== OFFLINE && /\s/.test(String(S.model))) S.model = DEFAULT_MODEL;  // migrate old friendly-label model values
+    if (!store.get('mig_model_2', false)) { if (S.model !== OFFLINE) S.model = DEFAULT_MODEL; store.set('model', S.model); store.set('mig_model_2', true); }  // one-time reset off the problematic gpt-oss default
     function saveSetting(k, v) { S[k] = v; store.set(k, v); }
     const rint = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo + 1));
 
@@ -288,11 +289,12 @@
         const r = await gmRequest({
             method: 'POST', url: GROQ_URL, timeout: AI_TIMEOUT_MS,
             headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + S.groqKey },
-            data: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 100 })
+            data: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 512 })
         });
         if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' ' + (r.responseText || '').slice(0, 140));
         const j = JSON.parse(r.responseText);
-        return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
+        const m = j.choices && j.choices[0] && j.choices[0].message;
+        return (m && (m.content || m.reasoning_content || m.reasoning)) || '';
     }
     async function fetchImageDataUrl(url) {
         const r = await gmRequest({ method: 'GET', url, responseType: 'blob', timeout: AI_TIMEOUT_MS });
@@ -360,7 +362,7 @@
   --fg:#e7ebf1; --fg-dim:#9aa6b7; --fg-faint:#6b7585; --accent:#2ad2c4; --accent-weak:#11312f; --accent-fg:#052321;
   --good:#3ecb79; --warn:#e0a33a; --warn-weak:#33280f; --bad:#ef6b6b; --shadow:0 14px 40px rgba(0,0,0,.55),0 2px 10px rgba(0,0,0,.4); }
 *{box-sizing:border-box}
-.panel{position:fixed;top:16px;right:16px;width:360px;height:min(600px,calc(100vh - 32px));min-width:300px;min-height:240px;max-width:96vw;max-height:calc(100vh - 32px);
+.panel{position:fixed;top:16px;right:16px;width:360px;height:560px;min-width:300px;min-height:0;max-width:96vw;max-height:calc(100vh - 24px);
   background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);
   font-family:var(--font);font-size:calc(13px*var(--fs));z-index:2147483646;display:flex;flex-direction:column;overflow:hidden;resize:both}
 .panel.off{filter:grayscale(.6) opacity(.72)}
@@ -376,7 +378,7 @@
 .iconbtn{width:28px;height:28px;border:1px solid var(--border);background:var(--surface);color:var(--fg-dim);border-radius:7px;cursor:pointer;font-size:13px;display:grid;place-items:center;padding:0}
 .iconbtn:hover{color:var(--fg);border-color:var(--accent)}
 .hdc{display:flex;gap:6px}
-.body{flex:0 0 auto}
+.scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden}
 .sec{padding:12px;border-bottom:1px solid var(--border-2);display:flex;flex-direction:column;gap:10px}
 .eyebrow{font-size:calc(10px*var(--fs));letter-spacing:.09em;text-transform:uppercase;color:var(--fg-faint);font-weight:600}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
@@ -401,10 +403,10 @@
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .idle{display:flex;align-items:center;gap:9px;color:var(--fg-dim);font-size:calc(12.5px*var(--fs))}
 .idle .eye{width:26px;height:26px;border-radius:8px;background:var(--surface-3);display:grid;place-items:center}
-.tabs{display:flex;gap:2px;padding:8px 10px 0;border-bottom:1px solid var(--border-2);flex:0 0 auto}
+.tabs{display:flex;gap:2px;padding:8px 10px 0;border-bottom:1px solid var(--border-2);position:sticky;top:0;z-index:2;background:var(--surface)}
 .tab{flex:1;border:none;background:transparent;color:var(--fg-dim);font-weight:600;font-size:calc(11.5px*var(--fs));font-family:var(--font);padding:8px 4px;cursor:pointer;border-bottom:2px solid transparent;border-radius:6px 6px 0 0}
 .tab[aria-selected="true"]{color:var(--fg);border-bottom-color:var(--accent);background:var(--surface-2)}
-.tabwrap{padding:12px;display:flex;flex-direction:column;gap:10px;flex:1 1 auto;min-height:0;overflow-y:auto}
+.tabwrap{padding:12px;display:flex;flex-direction:column;gap:10px}
 .log{display:flex;flex-direction:column;gap:8px}
 .logitem{border:1px solid var(--border-2);border-radius:9px;padding:8px 10px;background:var(--surface-2);display:flex;flex-direction:column;gap:3px}
 .logitem .lq{font-size:calc(11.5px*var(--fs));color:var(--fg-dim);line-height:1.3}
@@ -433,8 +435,8 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .hint{font-size:calc(10.5px*var(--fs));color:var(--fg-faint);line-height:1.4}
 .aistat{font-family:var(--mono);font-size:calc(10.5px*var(--fs));padding:2px 7px;border-radius:6px;border:1px solid var(--border)}
 .memview{background:var(--surface-2);border:1px solid var(--border-2);border-radius:8px;padding:8px 10px;font-family:var(--mono);font-size:calc(10.5px*var(--fs));color:var(--fg-dim);max-height:120px;overflow:auto;white-space:pre-wrap}
-.collapsed .body,.collapsed .tabs,.collapsed .tabwrap{display:none}
-.collapsed{resize:none;height:auto!important}
+.collapsed .scroll{display:none}
+.collapsed{resize:none!important;height:auto!important;min-height:0!important}
 @media (max-width:440px){.panel{left:12px;right:12px;width:auto;max-width:none}}
 </style>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
@@ -448,6 +450,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <button class="iconbtn" id="collapse" title="Collapse">&#9662;</button>
     </span>
   </header>
+  <div class="scroll" id="scroll">
   <div class="body" id="pbody">
     <div class="sec" id="qsec">
       <div class="eyebrow">Current question</div>
@@ -506,6 +509,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <div class="row"><label>AI for short answer</label><button class="toggle" id="tText"></button></div>
       <div class="hint">AI answers as soon as it replies; if it's too slow or fails it falls back to offline. Turn AI off for a type to use offline only (with a short random delay). Auto-submit OFF = it only proposes; you press Submit.</div>
     </div>
+  </div>
   </div>
 </section>`;
     }
@@ -650,9 +654,20 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     function showProposed(text, tier) { $('#tier').textContent = tier; $('#ansVal').value = text; autosize($('#ansVal')); }
     function readyAssisted() { setState('answered', 'Proposed'); $('#countTxt').textContent = 'Review & press Submit (auto-submit off)'; $('#countBar').style.transform = 'scaleX(1)'; }
 
+    function offlineResult(mode, q, aiFailed) {
+        if (mode === 'mcq') return { text: '(random option)', tier: aiFailed ? 'Random · AI failed' : 'Random', option: '' };
+        const off = offlineAnswer(q, !!q);
+        return { text: off.text, tier: aiFailed ? 'Offline · AI failed' : off.tier, option: off.text };
+    }
+    function applyOffline(aiFailed) {
+        const r = offlineResult(current.mode, current.q, aiFailed);
+        current.answer = { text: r.text, tier: r.tier }; current.optionText = r.option;
+        showProposed(r.text, r.tier);
+        if (!S.autoSubmit) { readyAssisted(); return; }
+        if (aiFailed) doSubmit(true); else startDelayCountdown();   // offline-only -> human-like delay; AI-failed -> prompt
+    }
     async function handleQuestion() {
-        const useAI = aiForType(current.mode);
-        if (useAI) {
+        if (aiForType(current.mode)) {
             const sig = current.sig;
             const imageUrl = current.q ? '' : getSlideImage();
             const caseBlurb = current.isCase && memory.length ? ('This is part of an ongoing case. Earlier: ' + memory[memory.length - 1] + '.') : '';
@@ -661,20 +676,11 @@ input[type=range]{width:100%;accent-color:var(--accent)}
             $('#countTxt').textContent = 'Waiting for AI…'; $('#countBar').style.transform = 'scaleX(1)';
             const res = await aiAnswer({ mode: current.mode, qText: current.q, choices: current.choiceTexts, imageUrl, caseBlurb });
             if (sig !== current.sig) return;
-            if (res) {
-                current.answer = res; current.optionText = res.text; showProposed(res.text, res.tier);
-                if (S.autoSubmit) doSubmit(true); else readyAssisted();
-                return;
-            }
-            const off = offlineAnswer(current.q, !!current.q);
-            current.answer = { text: off.text, tier: 'Offline (AI failed)' }; current.optionText = off.text;
-            showProposed(off.text, current.answer.tier);
-            if (S.autoSubmit) doSubmit(true); else readyAssisted();
+            if (res) { current.answer = res; current.optionText = res.text; showProposed(res.text, res.tier); if (S.autoSubmit) doSubmit(true); else readyAssisted(); return; }
+            applyOffline(true);
             return;
         }
-        const off = offlineAnswer(current.q, !!current.q);
-        current.answer = off; current.optionText = off.text; showProposed(off.text, off.tier);
-        if (S.autoSubmit) startDelayCountdown(); else readyAssisted();
+        applyOffline(false);
     }
     function startDelayCountdown() {
         clearCountdown();
@@ -765,5 +771,5 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     }
 
     updateMemoryView();
-    console.log('[AI Poll Assistant] v0.4.1 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
+    console.log('[AI Poll Assistant] v0.4.2 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
 })();
