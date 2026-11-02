@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Echo360 AI Poll Assistant
 // @namespace    https://github.com/rsharma929/echo360-ai-poll-assistant
-// @version      0.4.2
+// @version      0.4.3
 // @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with a resizable in-page panel. Answers MCQ + short answer via Groq (your free key) — reads the question from page text OR the slide image (vision). Offline pools as fallback.
 // @author       Rohan
 // @license      MIT
@@ -46,9 +46,9 @@
     const AI_TIMEOUT_MS = 9000;
     const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
     const GROQ_MODELS_URL = 'https://api.groq.com/openai/v1/models';
-    const DEFAULT_MODEL = 'llama-3.3-70b-versatile';   // reliable non-reasoning text default; click "Refresh" to pick others (incl. vision)
+    const DEFAULT_MODEL = 'openai/gpt-oss-120b';   // confirmed available on free tier; Refresh to pick others (reasoning handled below)
     const OFFLINE = 'offline';
-    const STARTER_MODELS = ['llama-3.3-70b-versatile', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
+    const STARTER_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'llama-3.3-70b-versatile'];
     const BASE_SYSTEM = 'You help a student answer a live medical-school class poll quickly ' +
         '(preclinical / basic sciences: anatomy, physiology, biochemistry, pharmacology, microbiology, ' +
         'pathology, histology). Answers need not be certain or fully correct. Be extremely brief.';
@@ -87,7 +87,8 @@
     const S = {};
     for (const k in DEFAULTS) S[k] = store.get(k, DEFAULTS[k]);
     if (S.model !== OFFLINE && /\s/.test(String(S.model))) S.model = DEFAULT_MODEL;  // migrate old friendly-label model values
-    if (!store.get('mig_model_2', false)) { if (S.model !== OFFLINE) S.model = DEFAULT_MODEL; store.set('model', S.model); store.set('mig_model_2', true); }  // one-time reset off the problematic gpt-oss default
+    if (!store.get('mig_model_2', false)) { if (S.model !== OFFLINE) S.model = DEFAULT_MODEL; store.set('model', S.model); store.set('mig_model_2', true); }  // (v0.4.2) legacy
+    if (!store.get('mig_model_3', false)) { if (S.model === 'llama-3.3-70b-versatile') { S.model = DEFAULT_MODEL; store.set('model', S.model); } store.set('mig_model_3', true); }  // v0.4.2 forced some onto a model their key 404s
     function saveSetting(k, v) { S[k] = v; store.set(k, v); }
     const rint = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo + 1));
 
@@ -669,7 +670,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     async function handleQuestion() {
         if (aiForType(current.mode)) {
             const sig = current.sig;
-            const imageUrl = current.q ? '' : getSlideImage();
+            const imageUrl = (current.mode === 'text' && !current.q) ? getSlideImage() : '';
             const caseBlurb = current.isCase && memory.length ? ('This is part of an ongoing case. Earlier: ' + memory[memory.length - 1] + '.') : '';
             setState('answering', imageUrl ? 'Reading slide…' : 'Thinking…');
             showProposed('', imageUrl ? 'Reading slide…' : 'Thinking…');
@@ -762,14 +763,14 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     function showQuestion() {
         $('#idleSec').hidden = true; $('#qsec').hidden = false; $('#ansSec').hidden = false;
         const typeLabel = current.mode === 'mcq' ? 'Multiple choice' : 'Short answer';
-        const isImg = !current.q;
+        const isImg = current.mode === 'text' && !current.q;
         $('#chips').innerHTML = '<span class="chip type">' + typeLabel + '</span>' +
             '<span class="chip">Q <b>' + current.num + '</b></span>' +
             (current.isCase ? '<span class="chip cas">Case</span>' : '');
-        const qt = $('#qtext'); qt.className = 'qtext' + (isImg ? ' dim' : '');
-        qt.textContent = current.q || '[shown as image — reading with AI…]';
+        const qt = $('#qtext'); qt.className = 'qtext' + (!current.q ? ' dim' : '');
+        qt.textContent = current.q || (isImg ? '[shown as image — reading with AI…]' : '[question text not found — answering from the options]');
     }
 
     updateMemoryView();
-    console.log('[AI Poll Assistant] v0.4.2 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
+    console.log('[AI Poll Assistant] v0.4.3 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
 })();
