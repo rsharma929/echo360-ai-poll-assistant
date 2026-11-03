@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Echo360 AI Poll Assistant
 // @namespace    https://github.com/rsharma929/echo360-ai-poll-assistant
-// @version      0.4.5
+// @version      0.5.0
 // @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with a resizable in-page panel. Answers MCQ + short answer via Groq (your free key) — reads the question from page text OR the slide image (vision). Offline pools as fallback.
 // @license      MIT
 // @match        https://*.ttpoll.com/*
@@ -52,27 +52,60 @@
         '(preclinical / basic sciences: anatomy, physiology, biochemistry, pharmacology, microbiology, ' +
         'pathology, histology). Answers need not be certain or fully correct. Be extremely brief.';
 
-    const DEFAULT_POOL = ['Supportive care', 'Monitor and reassess', 'Depends on the mechanism',
-        'Increased activity', 'Inflammation', 'Negative feedback', 'Homeostasis'];
+    const GENERAL_POOL = ["CBC","CBC with differential","Basic metabolic panel","Comprehensive metabolic panel","Supportive care","Monitor and reassess","Further workup","Reassurance and follow-up","Inflammation","Apoptosis","ATP","Negative feedback","Positive feedback","Homeostasis","Oxidative stress","Hypoxia","Ischemia","Necrosis","Mitochondria","Enzyme inhibition","Membrane potential","Signal transduction","Gene expression","Cell signaling","Protein folding","Diffusion","Active transport","Multifactorial","Idiopathic","Depends on the mechanism"];
     const CATEGORY_POOLS = {
         drug:      ['Beta blocker', 'ACE inhibitor', 'Penicillin', 'NSAID', 'Statin', 'Corticosteroid', 'Levothyroxine'],
         histology: ['Squamous epithelium', 'Goblet cells', 'Granuloma', 'Hyperplasia', 'Follicular cells', 'Columnar epithelium'],
         diagnosis: ['Iron deficiency anemia', 'Type 1 diabetes', 'Pneumonia', 'Hashimoto thyroiditis', 'Myocardial infarction'],
         outcome:   ['Decreased cardiac output', 'Hypoxia', 'Acidosis', 'Vasodilation', 'Increased mortality'],
         mechanism: ['Increased cAMP', 'Inhibits the enzyme', 'Blocks the receptor', 'Competitive inhibition', 'Increased sympathetic tone'],
-        general:   DEFAULT_POOL
+        general:   GENERAL_POOL
     };
-    const TOPIC_BANKS = {
-        thyroid: ['Levothyroxine', 'Hashimoto thyroiditis', 'Graves disease', 'TSH', 'Follicular cells', 'Methimazole', 'Hypothyroidism'],
-        cardio:  ['Reduced ejection fraction', 'Beta blocker', 'ACE inhibitor', 'Myocardial infarction', 'Afterload', 'Loop diuretic'],
-        renal:   ['RAAS activation', 'Loop diuretic', 'Acute tubular necrosis', 'GFR', 'Hyperkalemia', 'Metabolic acidosis'],
-        pulm:    ['Hypoxemia', 'V/Q mismatch', 'Bronchodilator', 'Surfactant', 'Pneumonia', 'Obstructive pattern'],
-        heme:    ['Iron deficiency anemia', 'Hemolysis', 'Thrombocytopenia', 'Vitamin B12 deficiency', 'Reticulocytes'],
-        gi:      ['PPI', 'H. pylori', 'Cirrhosis', 'Malabsorption', 'Portal hypertension'],
-        endo:    ['Insulin', 'Cortisol', 'Negative feedback', 'Diabetes mellitus', 'Thyroid hormone'],
-        neuro:   ['Acetylcholine', 'Dopamine', 'Upper motor neuron', 'Demyelination', 'Seizure'],
-        id:      ['Penicillin', 'Gram-positive cocci', 'Vancomycin', 'Sepsis', 'Endotoxin']
-    };
+    // Topic banks ported from pointsolutions-poll-automation (kept in sync). Type a lecture / WS
+    // topic in the Context tab; the first bank with a matching trigger word drives offline short
+    // answers. First match wins, keys are lowercase substrings, 40 answers each.
+    const TOPIC_BANKS = [
+        { keys: ["thyroid","endocrine","hormone","pituitary","adrenal","diabet","insulin","cortisol","glucose","hypoglyc","hyperglyc","acromegal","cushing","addison","parathyroid","aldosteron","glucagon","prolactin","growth hormone","goiter","thyrotox","gland","hypercalc","hypocalc"],
+          answers: ["TSH and free T4","Free T3","CBC","Thyroid ultrasound","TPO antibodies","Radioactive iodine uptake scan","Fine needle aspiration","Hashimoto thyroiditis","Graves disease","Levothyroxine","Methimazole","Propylthiouracil","Hypothyroidism","Hyperthyroidism","Follicular cells","Colloid","Parafollicular C cells","Thyroglobulin","Negative feedback","Goiter","Myxedema","Calcitonin","Insulin resistance","Cushing syndrome","Addison disease","Pheochromocytoma","Plasma metanephrines","ACTH","Aldosterone","Dexamethasone suppression test","Hemoglobin A1c","Metformin","Diabetic ketoacidosis","Parathyroid hormone","Hypercalcemia","Prolactinoma","Acromegaly","Growth hormone","Somatostatin","Adrenal cortex"] },
+        { keys: ["genetic","inherit","bayesian","mendel","pedigree","chromosom","mutation","dna","allele","genotype","phenotype","trisomy","aneuploid","karyotype","hereditary","congenital","deletion","translocation","imprint","penetrance","expressivity","polymorphism","genomic","locus"],
+          answers: ["Autosomal recessive","Autosomal dominant","X-linked recessive","X-linked dominant","Mitochondrial inheritance","Incomplete penetrance","Variable expressivity","Anticipation","Carrier testing","Karyotype","Pedigree analysis","Bayesian probability","Hardy-Weinberg equilibrium","De novo mutation","Nondisjunction","Trinucleotide repeat expansion","Genomic imprinting","Mosaicism","Punnett square","Consanguinity","Frameshift mutation","Missense mutation","Nonsense mutation","Silent mutation","FISH","Chromosomal microarray","CBC","Trisomy 21","Loss of heterozygosity","Codominance","Pleiotropy","Locus heterogeneity","Allelic heterogeneity","Point mutation","Uniparental disomy","Lyonization","Founder effect","Gene therapy","Linkage disequilibrium","Meiotic nondisjunction"] },
+        { keys: ["cardio","heart","cardiac","vascular","coronary","hypertens","ecg","ekg","circulat","arrhythmi","myocard","valve","aort","atrial","ventric","ischem","angina","atheroscler","blood pressure","pericard","endocard","murmur","tachycard","bradycard"],
+          answers: ["ECG","Troponin","CBC","Echocardiogram","Reduced ejection fraction","Myocardial infarction","Atherosclerosis","Beta blocker","ACE inhibitor","Loop diuretic","Afterload","Preload","Frank-Starling mechanism","Cardiac output","Automaticity","Cardiac action potential","L-type calcium channels","Left ventricular hypertrophy","Nitric oxide","Baroreceptor reflex","Angina pectoris","Statin","Ejection fraction","Atrial fibrillation","BNP","Lipid panel","Coronary angiography","Stress test","Nitroglycerin","Aspirin","Heparin","Stroke volume","Sinoatrial node","AV node","Purkinje fibers","Hypertension","Heart failure","Aortic stenosis","Mitral regurgitation","Pericarditis"] },
+        { keys: ["renal","kidney","nephro","glomer","urinary","urine","electrolyte","acid-base","dialysis","diuretic","sodium","potassium","filtrat","creatinine","proteinuria","hematuria","uremi","nephron","bladder","ureter","acidosis","alkalosis","renin","pyelonephr"],
+          answers: ["Urinalysis","Basic metabolic panel","CBC","GFR","Creatinine","RAAS activation","Acute tubular necrosis","Loop diuretic","Hyperkalemia","Metabolic acidosis","Nephrotic syndrome","Nephritic syndrome","Podocytes","Juxtaglomerular apparatus","Countercurrent multiplier","Aldosterone","ADH","Proximal convoluted tubule","Urinary casts","BUN","Renin","Proteinuria","Thiazide diuretic","Spironolactone","Chronic kidney disease","Glomerulonephritis","Renal clearance","Filtration fraction","Distal convoluted tubule","Loop of Henle","Macula densa","Angiotensin II","Erythropoietin","Hematuria","Red cell casts","Sodium reabsorption","Bicarbonate","Anion gap","Dialysis","Acute kidney injury"] },
+        { keys: ["pulm","respir","lung","airway","breath","ventilat","asthma","copd","bronch","alveol","oxygen","hypox","pneumo","pleur","gas exchang","spiromet","dyspnea","tidal","emphysem","embolism","hypercapn","trachea","atelectas"],
+          answers: ["Chest X-ray","Arterial blood gas","CBC","Spirometry","Hypoxemia","V/Q mismatch","Bronchodilator","Surfactant","Pneumonia","Obstructive pattern","Restrictive pattern","Type II pneumocytes","Alveoli","Oxygen-hemoglobin dissociation curve","Dead space","Lung compliance","Hypercapnia","Pulmonary edema","Cilia","Goblet cells","COPD","Asthma","Albuterol","Inhaled corticosteroids","Pulmonary embolism","CT pulmonary angiogram","FEV1/FVC ratio","Tidal volume","Residual volume","Partial pressure of oxygen","Hypoventilation","Pulmonary fibrosis","Club cells","Type I pneumocytes","Respiratory acidosis","Bronchoconstriction","Pleural effusion","Pulse oximetry","Hypoxic pulmonary vasoconstriction","Carbon dioxide transport"] },
+        { keys: ["gastro","liver","hepat","intestin","bowel","digest","pancrea","biliary"," gi ","stomach","colorect","esophag","duoden","jaundice","cirrhos","ulcer","absorpt","bile","gallbladder","portal","ascites","diarrhea","constipat","splanchnic"],
+          answers: ["CBC","Liver function tests","Lipase","Amylase","PPI","H. pylori","Cirrhosis","Portal hypertension","Malabsorption","Peptic ulcer","Intestinal villi","Brush border","Parietal cells","Bile","Bilirubin","Pancreatic enzymes","Hepatocytes","Chief cells","Gastrin","Secretin","Hepatic steatosis","Ascites","Cholecystitis","Abdominal ultrasound","Upper endoscopy","Colonoscopy","Inflammatory bowel disease","Pancreatitis","Jaundice","Kupffer cells","Enterohepatic circulation","Cholecystokinin","Hydrochloric acid","Pepsin","Intrinsic factor","Bile salts","Alkaline phosphatase","Portal triad","Omeprazole","Liver biopsy"] },
+        { keys: ["heme","haema","hemat","blood","anemia","anaemia","leukem","coag","platelet","clott","thrombo","hemoglobin","bleeding","bone marrow","lymphoma","sickle","transfus","iron","erythro","neutropen","hemostas","spleen"],
+          answers: ["CBC","CBC with differential","Peripheral blood smear","Iron studies","Iron deficiency anemia","Hemolysis","Thrombocytopenia","Vitamin B12 deficiency","Reticulocyte count","Hemoglobin","Sickle cell disease","Spherocytes","Coagulation cascade","Platelets","Erythropoietin","Hematocrit","Megaloblastic anemia","Ferritin","Haptoglobin","Bone marrow biopsy","Prothrombin time","Partial thromboplastin time","Folate deficiency","Thalassemia","Von Willebrand factor","Fibrinogen","Factor VIII","Warfarin","Heparin","Vitamin K","D-dimer","Schistocytes","Hemophilia","Leukocytosis","Blast cells","Howell-Jolly bodies","Target cells","Direct Coombs test","Hemoglobin electrophoresis","Anisocytosis"] },
+        { keys: ["neuro","brain","nerve","cns","spinal","cerebr","demyelin","synap","neurotransmit","seizure","stroke","cortex","motor","sensory","reflex","axon","glia","parkinson","alzheimer","meningitis","cerebell","cranial"],
+          answers: ["MRI brain","Lumbar puncture","CBC","Acetylcholine","Dopamine","GABA","Glutamate","Upper motor neuron","Lower motor neuron","Demyelination","Seizure","Action potential","Myelin sheath","Oligodendrocytes","Astrocytes","Blood-brain barrier","Resting membrane potential","Reflex arc","Ischemic stroke","Multiple sclerosis","Substantia nigra","CT head","Norepinephrine","Serotonin","Saltatory conduction","Nodes of Ranvier","Schwann cells","Microglia","Neuromuscular junction","Parkinson disease","Alzheimer disease","Basal ganglia","Cerebellum","Corticospinal tract","Dorsal columns","CSF analysis","Long-term potentiation","Voltage-gated sodium channels","Levodopa","Spinal reflex"] },
+        { keys: ["micro","infect","bacteri","virus","viral","antibiotic","sepsis","pathogen","fung","parasit","gram stain","gram-negative","gram-positive","culture","vaccin","antimicrob","resistance","toxin","biofilm","mycobacter","staph","strep","protozoa","immuniz","epidemic"],
+          answers: ["CBC","Blood cultures","Gram stain","Penicillin","Vancomycin","Gram-positive cocci","Gram-negative rods","Sepsis","Endotoxin","Exotoxin","Beta-lactam","Lipopolysaccharide","Biofilm","Catalase positive","Coagulase positive","Obligate anaerobe","Culture and sensitivity","Cell wall synthesis inhibition","Leukocytosis","Fever","Ceftriaxone","Azithromycin","Methicillin resistance","Peptidoglycan","Spore formation","Acid-fast stain","Mycobacterium tuberculosis","Polymerase chain reaction","Antigenic shift","Reverse transcriptase","Bacterial capsule","Flagella","Lytic cycle","Beta-hemolysis","Minimum inhibitory concentration","Fluoroquinolone","Aminoglycoside","Protein synthesis inhibition","Viral envelope","Opportunistic infection"] },
+        { keys: ["immun","antibody","antigen","complement","hypersensitiv","allerg","autoimmun","inflammat","cytokine","lymphocyte","t cell","b cell","mhc","interleukin","interferon","tolerance","transplant","phagocyt","innate","adaptive","immunoglobulin","chemokine"],
+          answers: ["CBC","Flow cytometry","IgG","IgM","IgA","IgE","IgD","Complement activation","T cells","B cells","MHC class I","MHC class II","Cytokines","Type I hypersensitivity","Type II hypersensitivity","Type III hypersensitivity","Type IV hypersensitivity","Macrophages","Neutrophils","Antigen presentation","Cytotoxic T cells","Helper T cells","Interleukins","Clonal selection","Natural killer cells","Dendritic cells","Interferon gamma","Tumor necrosis factor","Central tolerance","Opsonization","Memory B cells","Plasma cells","Histamine","Mast cells","Regulatory T cells","Antibody class switching","Membrane attack complex","Toll-like receptors","Perforin","Immunodeficiency"] },
+        { keys: ["biochem","metabol","enzyme","glycol","krebs","citric","lipid","protein","atp","carbohydrate","amino acid","catabol","anabol","mitochond","cofactor","phosphoryl","substrate","molecular","nucleotide","pathway","oxidative","bioenerget"],
+          answers: ["Glycolysis","Citric acid cycle","Oxidative phosphorylation","ATP","NADH","FADH2","Gluconeogenesis","Beta oxidation","Rate-limiting enzyme","Allosteric regulation","Michaelis-Menten kinetics","Cofactor","Pyruvate","Acetyl-CoA","Urea cycle","Pentose phosphate pathway","Vitamin B12","Enzyme kinetics","Feedback inhibition","Lactate","CBC","Km","Vmax","Competitive inhibitor","Noncompetitive inhibitor","Electron transport chain","Glycogen synthesis","Glycogenolysis","Ketone bodies","Fatty acid synthesis","Cholesterol synthesis","Phosphofructokinase-1","Hexokinase","Coenzyme A","NADPH","Substrate-level phosphorylation","Lipoprotein lipase","Glucose-6-phosphate","Thiamine","Proteolysis"] },
+        { keys: ["pharm","drug","medication","receptor","agonist","dose","kinetic","antagonist","bioavail","clearance","half-life","potency","efficacy","toxicity","adverse","therapeutic","inhibitor","dosing","excretion","distribution","p450","prodrug"],
+          answers: ["Beta blocker","ACE inhibitor","NSAID","Statin","Competitive inhibition","Agonist","Antagonist","First-pass metabolism","Half-life","Cytochrome P450","Volume of distribution","Receptor binding","Efficacy","Potency","Therapeutic index","Loading dose","Zero-order kinetics","First-order kinetics","Bioavailability","CBC","Partial agonist","Inverse agonist","Noncompetitive antagonist","ED50","LD50","Steady state","Renal excretion","Hepatic metabolism","Enzyme induction","Enzyme inhibition","Maintenance dose","Clearance","Tolerance","Drug-drug interaction","Phase I metabolism","Phase II metabolism","Prodrug","Receptor downregulation","Cholinergic","Adrenergic"] },
+        { keys: ["repro","pregnan","fetal","foetal","gonad","menstru","ovar","testis","obstet","gynec","uterus","sperm","estrogen","progesteron","testosteron","fertil","placenta","contracept","puberty","lactation","oocyte","androgen"],
+          answers: ["CBC","Beta-hCG","Pelvic ultrasound","Estrogen","Progesterone","LH surge","FSH","Spermatogenesis","Oogenesis","Placenta","Leydig cells","Sertoli cells","Corpus luteum","Menstrual cycle","Testosterone","Meiosis","Trophoblast","Zona pellucida","Ovulation","Follicular phase","Luteal phase","Inhibin","Human chorionic gonadotropin","Dihydrotestosterone","Aromatase","Endometrium","Seminiferous tubules","Acrosome reaction","Capacitation","Blastocyst","Implantation","Granulosa cells","Theca cells","GnRH","Prolactin","Oxytocin","Amniotic fluid","Gametogenesis","Spermatozoa","Progesterone withdrawal"] },
+        { keys: ["musculo","bone","muscle","skelet","ortho","skin","derm","joint","connective","cartilage","collagen","tendon","fracture","arthrit","osteo","sarcomere","myofiber","ligament","keratin","epidermis","contraction","actin"],
+          answers: ["CBC","X-ray","Osteoblasts","Osteoclasts","Collagen","Actin and myosin","Sarcomere","Calcium","Vitamin D","Rheumatoid arthritis","Keratinocytes","Melanocytes","Fibroblasts","Epidermis","Troponin","Osteoporosis","Cross-bridge cycling","Hydroxyapatite","Osteoarthritis","Gout","Uric acid","Synovial fluid","Z-line","Tropomyosin","Sarcoplasmic reticulum","Myosin ATPase","Type I collagen","Osteoid","Parathyroid hormone","Alkaline phosphatase","Dermis","Stratum corneum","Elastin","Chondrocytes","Rhabdomyolysis","Creatine kinase","Motor unit","Fast-twitch fibers","Slow-twitch fibers","DEXA scan"] },
+        { keys: ["embryo","developmen","gastrula","neural tube","organogen","germ layer","teratogen","morphogen","pharyngeal","somite","notochord","ectoderm","mesoderm","endoderm","cleavage","fetal circ","branchial","neural crest","limb bud","congenital malform","neurulat","primitive streak"],
+          answers: ["Ectoderm","Mesoderm","Endoderm","Neural crest cells","Neural tube","Notochord","Gastrulation","Somites","Pharyngeal arches","Teratogen","Folic acid","Neural tube defect","Organogenesis","Morphogen gradient","Sonic hedgehog","HOX genes","Blastocyst","Trophoblast","Yolk sac","Allantois","Foramen ovale","Ductus arteriosus","Ductus venosus","Branchial clefts","Limb buds","Apoptosis","Fetal hemoglobin","Placental circulation","Germ layers","Primitive streak","Cleavage","Neurulation","Cardiac looping","Spina bifida","Cleft palate","Retinoic acid","CBC","Obstetric ultrasound","Amniocentesis","Umbilical vessels"] },
+        { keys: ["histolog","cytolog","organelle","epitheli","cytoskelet","membrane transport","ribosom","golgi","endoplasm","lysosom","nucleolus","microtubul","cell junction","cilia","secretory","connective tissue","histochem","microscop","cell cycle","membrane protein","intracellular","extracellular"],
+          answers: ["Epithelial tissue","Simple squamous epithelium","Stratified squamous epithelium","Columnar epithelium","Connective tissue","Golgi apparatus","Rough endoplasmic reticulum","Smooth endoplasmic reticulum","Lysosomes","Peroxisomes","Mitochondria","Ribosomes","Nucleus","Nucleolus","Cytoskeleton","Microtubules","Actin filaments","Intermediate filaments","Tight junctions","Desmosomes","Gap junctions","Basement membrane","Cilia","Microvilli","Cell membrane","Phospholipid bilayer","Sodium-potassium pump","Endocytosis","Exocytosis","Hematoxylin and eosin stain","Apoptosis","Cell cycle","Mitosis","G1 phase","S phase","Centrioles","Flagella","Collagen fibers","Elastic fibers","CBC"] },
+        { keys: ["biostat","statisti","epidemiolog","sensitiv","specific","prevalenc","incidence","p-value","confidence interval","correlat","regression","cohort","case-control","randomiz","bias","hypothesis test","risk ratio","odds ratio","screening","likelihood ratio","predictive value","meta-analys","confound","significance"],
+          answers: ["Sensitivity","Specificity","Positive predictive value","Negative predictive value","Prevalence","Incidence","P-value","Confidence interval","Relative risk","Odds ratio","Absolute risk reduction","Number needed to treat","Cohort study","Case-control study","Randomized controlled trial","Selection bias","Recall bias","Confounding","Null hypothesis","Type I error","Type II error","Statistical power","Mean","Median","Mode","Standard deviation","Normal distribution","Correlation coefficient","Linear regression","Meta-analysis","Systematic review","Hazard ratio","Likelihood ratio","Attributable risk","Lead-time bias","Chi-square test","Student t-test","Kaplan-Meier curve","Intention-to-treat analysis","Cross-sectional study"] },
+        { keys: ["neoplas","oncolog","cancer","tumor","tumour","carcinoma","malignan","metasta","carcinogen","sarcoma","oncogene","apopto","angiogen","chemotherap","radiation therap","biopsy","tumor grad","tumor stag","dysplasia","proliferat","benign","mitotic"],
+          answers: ["Biopsy","CBC","Oncogene","Tumor suppressor gene","p53","Metastasis","Carcinoma in situ","Adenocarcinoma","Squamous cell carcinoma","Angiogenesis","Evasion of apoptosis","Dysplasia","Anaplasia","Tumor grading","Tumor staging","TNM staging","Chemotherapy","Radiation therapy","Tumor markers","Proto-oncogene","RAS mutation","Loss of heterozygosity","Immunohistochemistry","Mitotic index","Benign tumor","Malignant tumor","Carcinogen","Metaplasia","Hyperplasia","Neovascularization","Cachexia","Tumor microenvironment","Monoclonal origin","Telomerase activation","Loss of contact inhibition","BRCA mutation","Lymphatic spread","Paraneoplastic syndrome","Necrosis","Flow cytometry"] },
+        { keys: ["psych","behavior","mood","depress","anxiety","schizophren","bipolar","cognitive","mental health","mental illness","addiction","substance","antidepress","antipsychot","personality","delirium","dementia","post-traumatic","phobia","ocd","dopamine reward","withdrawal"],
+          answers: ["Selective serotonin reuptake inhibitor","Serotonin","Dopamine","Norepinephrine","GABA","Major depressive disorder","Generalized anxiety disorder","Bipolar disorder","Schizophrenia","Antipsychotics","Benzodiazepines","Fluoxetine","Sertraline","Lithium","Dopamine hypothesis","Positive symptoms","Negative symptoms","Cognitive behavioral therapy","Monoamine hypothesis","Tricyclic antidepressants","MAO inhibitors","Serotonin syndrome","Extrapyramidal symptoms","Tardive dyskinesia","Dependence","Tolerance","Withdrawal","Reward pathway","Nucleus accumbens","Limbic system","Amygdala","Hippocampus","Classical conditioning","Operant conditioning","Delirium","Dementia","Post-traumatic stress disorder","Obsessive-compulsive disorder","CBC","Mental status exam"] },
+        { keys: ["nutrit","vitamin","mineral","deficienc","malnutrit","diet","folate","folic","thiamine","scurvy","rickets","trace element","zinc","niacin","cobalamin","retinol","calciferol","tocopherol","biotin","pyridoxine","micronutrient","antioxidant","riboflavin"],
+          answers: ["Vitamin A","Vitamin B1 (thiamine)","Vitamin B2 (riboflavin)","Vitamin B3 (niacin)","Vitamin B6 (pyridoxine)","Vitamin B9 (folate)","Vitamin B12 (cobalamin)","Vitamin C","Vitamin D","Vitamin E","Vitamin K","Scurvy","Rickets","Beriberi","Pellagra","Wernicke encephalopathy","Iron","Zinc","Iodine","Calcium","Magnesium","Folate deficiency","Megaloblastic anemia","Night blindness","Fat-soluble vitamins","Water-soluble vitamins","Intrinsic factor","Antioxidant","Collagen synthesis","Marasmus","Kwashiorkor","Albumin","Prealbumin","CBC","Body mass index","Basal metabolic rate","Omega-3 fatty acids","Selenium","Copper","Homocysteine"] }
+    ];
 
     const store = {
         get(k, d) { try { if (typeof GM_getValue !== 'undefined') { const v = GM_getValue(NS + k, '\u0000'); return v === '\u0000' ? d : v; } const s = localStorage.getItem(NS + k); return s === null ? d : JSON.parse(s); } catch (e) { return d; } },
@@ -245,8 +278,7 @@
     // ==========================================================================
     // 2. OFFLINE ANSWERS (fallback tier)
     // ==========================================================================
-    const STOP = new Set(['the', 'a', 'an', 'of', 'to', 'is', 'are', 'and', 'or', 'for', 'in', 'on',
-        'with', 'what', 'which', 'this', 'that', 'patient', 'following', 'most', 'likely', 'best']);
+    const STOP = new Set(["the","a","an","of","to","is","are","and","or","for","in","on","with","what","which","this","that","patient","following","most","likely","best","application","calculation","disorders","disorder","medical","introduction","overview","lecture","part","approach","clinical","basic","science","sciences","principles","foundations","systems","system","week","module","unit","case","cases","review","intro","physiology","pathology","biology","function","structure"]);
     function classify(q) {
         const t = (q || '').toLowerCase();
         if (/\btrue or false\b/.test(t)) return 'tf';
@@ -261,20 +293,20 @@
     }
     const pick = arr => arr[Math.floor(Math.random() * arr.length)];
     function topicBank() {
-        const t = (S.topic || '').toLowerCase();
-        if (!t) return null;
-        for (const k in TOPIC_BANKS) if (t.includes(k)) return TOPIC_BANKS[k];
+        const t = ' ' + (S.topic || '').toLowerCase() + ' ';
+        if (!t.trim()) return null;
+        for (const b of TOPIC_BANKS) if (b.keys.some(k => t.includes(k))) return b.answers;
         const words = t.split(/[^a-z]+/).filter(w => w.length > 3 && !STOP.has(w));
-        return words.length ? words.map(w => w[0].toUpperCase() + w.slice(1)) : null;
+        return words.length ? words.map(w => w[0].toUpperCase() + w.slice(1)).concat(GENERAL_POOL) : null;
     }
     function offlineAnswer(qText, hasText) {
         const cat = classify(qText);
         if (cat === 'tf') return { text: pick(['True', 'False']), tier: 'Offline' };
         if (cat === 'yn') return { text: pick(['Yes', 'No']), tier: 'Offline' };
-        if (hasText && CATEGORY_POOLS[cat]) return { text: pick(CATEGORY_POOLS[cat]), tier: 'Offline' };
         const bank = topicBank();
         if (bank) return { text: pick(bank), tier: 'Offline · topic' };
-        return { text: pick(DEFAULT_POOL), tier: 'Offline' };
+        if (hasText && CATEGORY_POOLS[cat]) return { text: pick(CATEGORY_POOLS[cat]), tier: 'Offline' };
+        return { text: pick(GENERAL_POOL), tier: 'Offline' };
     }
 
     // ==========================================================================
@@ -512,7 +544,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         <textarea class="input" id="ctxBox" placeholder="e.g. thyroid — hypothyroidism, Hashimoto, histology"></textarea></div>
       <div class="field"><label>Session memory <span class="hint">— built automatically</span></label>
         <div class="memview" id="memView">nothing yet</div></div>
-      <div class="hint">Both the topic and the memory clear automatically when a new session starts.</div>
+      <div class="hint">The memory clears automatically when a new session starts; your topic stays until you change it.</div>
     </div>
     <div data-panel="set" hidden>
       <div class="row"><label>AI status</label><span class="aistat" id="aiStat">checking…</span></div>
@@ -748,7 +780,6 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     let sessionKey = '';
     function resetSession() {
         memory = []; updateMemoryView();
-        saveSetting('topic', ''); if ($('#ctxBox')) $('#ctxBox').value = '';
         const lb = $('#log'); if (lb) lb.innerHTML = '<div class="hint">New session — log cleared.</div>';
         current = { sig: '', mode: null, q: '', num: 0, done: false, isCase: false, choiceEls: [], choiceTexts: [], inputEl: null, answer: null, optionText: '' };
     }
@@ -795,5 +826,5 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     }
 
     updateMemoryView();
-    console.log('[AI Poll Assistant] v0.4.5 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
+    console.log('[AI Poll Assistant] v0.5.0 loaded. GM_xmlhttpRequest: ' + (typeof GM_xmlhttpRequest !== 'undefined' || (typeof GM !== 'undefined' && GM.xmlHttpRequest) ? 'yes' : 'NO') + '; key: ' + (hasKey() ? 'set' : 'none') + '; auto-submit ' + (S.autoSubmit ? 'ON' : 'OFF'));
 })();
