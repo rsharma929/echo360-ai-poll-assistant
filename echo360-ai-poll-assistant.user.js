@@ -3,7 +3,6 @@
 // @namespace    https://github.com/rsharma929/echo360-ai-poll-assistant
 // @version      0.4.5
 // @description  AI-assisted responder for PointSolutions / Echo360 browser polls, with a resizable in-page panel. Answers MCQ + short answer via Groq (your free key) — reads the question from page text OR the slide image (vision). Offline pools as fallback.
-// @author       Rohan
 // @license      MIT
 // @match        https://*.ttpoll.com/*
 // @match        https://ttpoll.com/*
